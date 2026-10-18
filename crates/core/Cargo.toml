@@ -1,0 +1,9 @@
+[package]
+name = "dejay-core"
+description = "Mixing logic for dejay: keys, compatibility, smart reorder, transitions and wire types."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true

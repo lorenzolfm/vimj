@@ -1,0 +1,15 @@
+[package]
+name = "dejay-audio"
+description = "dejay's audio side: decoding, analysis (tempo, beats, key, energy, loudness) and the two-deck mix engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dejay-core.workspace = true
+anyhow.workspace = true
+realfft = "3"
+ebur128 = "0.1"
+signalsmith-stretch = "0.1"
+cpal = "0.18"
+rtrb = "0.4"

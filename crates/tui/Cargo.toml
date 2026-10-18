@@ -1,0 +1,19 @@
+[package]
+name = "dejay"
+description = "Terminal frontend for dejay."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dejay-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+dirs.workspace = true
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+unicode-width = "0.2"
