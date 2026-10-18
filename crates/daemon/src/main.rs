@@ -1,4 +1,4 @@
-//! dejayd: keeps the music library, downloads songs with yt-dlp, analyses
+//! vimjd: keeps the music library, downloads songs with yt-dlp, analyses
 //! them and plays mixes on the sound card. Frontends talk to it over HTTP on
 //! 127.0.0.1.
 
@@ -12,8 +12,8 @@ mod playback;
 
 use anyhow::{Context, Result, bail};
 use app::App;
-use dejay_audio::player::Output;
-use dejay_core::protocol::DEFAULT_PORT;
+use vimj_audio::player::Output;
+use vimj_core::protocol::DEFAULT_PORT;
 use tracing_subscriber::EnvFilter;
 
 struct Args {
@@ -23,10 +23,10 @@ struct Args {
 
 fn args() -> Result<Args> {
     let mut args = Args { port: DEFAULT_PORT, output: Output::Device };
-    if let Ok(port) = std::env::var("DEJAY_PORT") {
-        args.port = port.parse().context("DEJAY_PORT is not a port number")?;
+    if let Ok(port) = std::env::var("VIMJ_PORT") {
+        args.port = port.parse().context("VIMJ_PORT is not a port number")?;
     }
-    if std::env::var("DEJAY_AUDIO").is_ok_and(|v| v == "null") {
+    if std::env::var("VIMJ_AUDIO").is_ok_and(|v| v == "null") {
         args.output = Output::Null;
     }
     let mut it = std::env::args().skip(1);
@@ -36,8 +36,8 @@ fn args() -> Result<Args> {
             "--silent" => args.output = Output::Null,
             "--help" | "-h" => {
                 println!(
-                    "usage: dejayd [--port PORT] [--silent]\n\n\
-                     The dejay daemon. Start the `dejay` TUI to use it.\n\
+                    "usage: vimjd [--port PORT] [--silent]\n\n\
+                     The vimj daemon. Start the `vimj` TUI to use it.\n\
                      --silent plays into nothing instead of the sound card."
                 );
                 std::process::exit(0);
@@ -51,13 +51,13 @@ fn args() -> Result<Args> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("dejayd=info")))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("vimjd=info")))
         .with_writer(std::io::stderr)
         .init();
     let args = args()?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port))
         .await
-        .with_context(|| format!("binding 127.0.0.1:{}; is dejayd already running?", args.port))?;
+        .with_context(|| format!("binding 127.0.0.1:{}; is vimjd already running?", args.port))?;
     let app = App::new(config::Paths::new()?, args.output)?;
     tracing::info!("songs live in {}", app.music_dir.display());
     match app.playback.device() {

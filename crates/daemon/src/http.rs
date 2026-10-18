@@ -1,4 +1,4 @@
-//! The local HTTP API frontends talk to. See `dejay_core::protocol`.
+//! The local HTTP API frontends talk to. See `vimj_core::protocol`.
 
 use crate::app::App;
 use crate::library;
@@ -8,9 +8,9 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use dejay_audio::engine::Command;
-use dejay_core::Transition;
-use dejay_core::protocol::*;
+use vimj_audio::engine::Command;
+use vimj_core::Transition;
+use vimj_core::protocol::*;
 use futures_util::{Stream, StreamExt};
 use std::convert::Infallible;
 use std::sync::Arc;

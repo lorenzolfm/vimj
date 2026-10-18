@@ -3,9 +3,9 @@
 //! reports what is playing.
 
 use crate::library::{self, Library};
-use dejay_audio::engine::{Command, Plan, State};
-use dejay_audio::player::{Output, Player};
-use dejay_core::protocol::{Mixing, PlayerState, PlayerStatus};
+use vimj_audio::engine::{Command, Plan, State};
+use vimj_audio::player::{Output, Player};
+use vimj_core::protocol::{Mixing, PlayerState, PlayerStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;

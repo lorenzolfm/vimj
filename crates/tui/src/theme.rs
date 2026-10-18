@@ -1,7 +1,7 @@
 //! Colours and text formatting shared by the views.
 
-use dejay_core::camelot::Camelot;
-use dejay_core::{Analysis, Transition};
+use vimj_core::camelot::Camelot;
+use vimj_core::{Analysis, Transition};
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 

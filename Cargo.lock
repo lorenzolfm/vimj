@@ -659,62 +659,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dejay"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "dejay-core",
- "dirs",
- "futures-util",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "unicode-width",
-]
-
-[[package]]
-name = "dejay-audio"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "cpal",
- "dejay-core",
- "ebur128",
- "realfft",
- "rtrb",
- "signalsmith-stretch",
-]
-
-[[package]]
-name = "dejay-core"
-version = "0.2.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "dejayd"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "axum",
- "dejay-audio",
- "dejay-core",
- "dirs",
- "futures-util",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3503,6 +3447,62 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vimj"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "dirs",
+ "futures-util",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "unicode-width",
+ "vimj-core",
+]
+
+[[package]]
+name = "vimj-audio"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "ebur128",
+ "realfft",
+ "rtrb",
+ "signalsmith-stretch",
+ "vimj-core",
+]
+
+[[package]]
+name = "vimj-core"
+version = "0.2.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "vimjd"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "dirs",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "vimj-audio",
+ "vimj-core",
+]
 
 [[package]]
 name = "vtparse"

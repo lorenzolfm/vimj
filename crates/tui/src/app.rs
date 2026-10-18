@@ -5,7 +5,7 @@
 use crate::client::Client;
 use crate::editor::{self, Action, Editor};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
-use dejay_core::protocol::*;
+use vimj_core::protocol::*;
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -1051,7 +1051,7 @@ impl App {
         });
     }
 
-    fn save_transition(&mut self, t: dejay_core::Transition) {
+    fn save_transition(&mut self, t: vimj_core::Transition) {
         let Some(ed) = &mut self.editor else { return };
         let Some((from, to)) = ed.pair() else { return };
         let restart = ed.previewing && std::mem::take(&mut ed.restart_preview);

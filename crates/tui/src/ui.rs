@@ -5,8 +5,8 @@ use crate::app::{App, Confirm, Focus, Mode, Popup, View};
 use crate::editor;
 use crate::theme::*;
 use crate::wave;
-use dejay_core::compat::{Compat, TempoRelation};
-use dejay_core::protocol::*;
+use vimj_core::compat::{Compat, TempoRelation};
+use vimj_core::protocol::*;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -82,7 +82,7 @@ fn scroll_to(offset: usize, selected: usize, height: usize, margin: usize) -> us
 
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Sidebar;
-    let block = panel("dejay", focused);
+    let block = panel("vimj", focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width as usize;
@@ -144,7 +144,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(list) = app.list.as_ref().filter(|l| Some(l.id.as_str()) == app.current_id()) else {
         frame.render_widget(panel("Library", focused), area);
         let inner = area.inner(ratatui::layout::Margin::new(2, 1));
-        let message = if app.connected { "Loading…" } else { "Connecting to dejayd…" };
+        let message = if app.connected { "Loading…" } else { "Connecting to vimjd…" };
         frame.render_widget(Paragraph::new(Line::styled(message, dim())), inner);
         return;
     };
@@ -371,7 +371,7 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, area);
     let [info, wave_row, next_row] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).areas(inner);
     let Some(p) = app.player.clone().filter(|p| p.song.is_some()) else {
-        let message = if app.connected { "  Nothing playing. Enter plays the song under the cursor." } else { "  Not connected to dejayd." };
+        let message = if app.connected { "  Nothing playing. Enter plays the song under the cursor." } else { "  Not connected to vimjd." };
         frame.render_widget(Paragraph::new(Line::styled(message, dim())), info);
         return;
     };

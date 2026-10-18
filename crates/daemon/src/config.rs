@@ -13,13 +13,13 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Result<Paths> {
-        let config_dir = match std::env::var_os("DEJAY_CONFIG_DIR") {
+        let config_dir = match std::env::var_os("VIMJ_CONFIG_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => dirs::config_dir().context("no config directory")?.join("dejay"),
+            None => dirs::config_dir().context("no config directory")?.join("vimj"),
         };
-        let data = match std::env::var_os("DEJAY_DATA_DIR") {
+        let data = match std::env::var_os("VIMJ_DATA_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => dirs::data_dir().context("no data directory")?.join("dejay"),
+            None => dirs::data_dir().context("no data directory")?.join("vimj"),
         };
         let paths = Paths {
             config: config_dir.join("config.toml"),
@@ -37,7 +37,7 @@ impl Paths {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// Where songs are kept. Defaults to `~/Music/dejay`.
+    /// Where songs are kept. Defaults to `~/Music/vimj`.
     pub music_dir: Option<PathBuf>,
     pub yt_dlp: Option<PathBuf>,
     pub ffmpeg: Option<PathBuf>,
@@ -57,10 +57,10 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(e.into()),
         };
-        if let Some(dir) = std::env::var_os("DEJAY_MUSIC_DIR") {
+        if let Some(dir) = std::env::var_os("VIMJ_MUSIC_DIR") {
             config.music_dir = Some(PathBuf::from(dir));
         }
-        if let Some(bin) = std::env::var_os("DEJAY_YT_DLP") {
+        if let Some(bin) = std::env::var_os("VIMJ_YT_DLP") {
             config.yt_dlp = Some(PathBuf::from(bin));
         }
         Ok(config)
@@ -73,7 +73,7 @@ impl Config {
     /// The music directory, created if needed; falls back to the data directory.
     pub fn music_dir(&self, paths: &Paths) -> PathBuf {
         let dir = self.music_dir.clone().unwrap_or_else(|| {
-            dirs::audio_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Music")).join("dejay")
+            dirs::audio_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Music")).join("vimj")
         });
         match std::fs::create_dir_all(&dir) {
             Ok(()) => dir,

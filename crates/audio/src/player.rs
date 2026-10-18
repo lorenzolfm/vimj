@@ -63,14 +63,14 @@ impl Player {
         {
             let commands = commands.clone();
             std::thread::Builder::new()
-                .name("dejay-loader".into())
+                .name("vimj-loader".into())
                 .spawn(move || loader(load_inbox, commands, ffmpeg, rate))
                 .expect("spawning the loader thread");
         }
         {
             let snapshot = snapshot.clone();
             std::thread::Builder::new()
-                .name("dejay-render".into())
+                .name("vimj-render".into())
                 .spawn(move || render(Engine::new(rate), inbox, loads, ring_in, snapshot, on_change))
                 .expect("spawning the render thread");
         }
@@ -168,7 +168,7 @@ fn open_device(ring: RingOut) -> Result<(u32, String), (String, RingOut)> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(u32, String), String>>();
     let (back_tx, back_rx) = mpsc::channel::<RingOut>();
     std::thread::Builder::new()
-        .name("dejay-output".into())
+        .name("vimj-output".into())
         .spawn(move || {
             let host = cpal::default_host();
             let Some(device) = host.default_output_device() else {
@@ -261,7 +261,7 @@ fn build<T: SizedSample + FromSample<f32>>(
 /// Drains the ring at real-time speed into nothing.
 fn null_output(mut ring: RingOut, rate: u32) {
     std::thread::Builder::new()
-        .name("dejay-null-output".into())
+        .name("vimj-null-output".into())
         .spawn(move || {
             let start = Instant::now();
             let mut consumed: u64 = 0;

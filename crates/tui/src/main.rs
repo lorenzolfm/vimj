@@ -1,4 +1,4 @@
-//! dejay: terminal frontend. Starts `dejayd` in the background if it is not
+//! vimj: terminal frontend. Starts `vimjd` in the background if it is not
 //! already running, then talks to it over HTTP.
 
 mod app;
@@ -13,7 +13,7 @@ use app::{App, Msg};
 use client::Client;
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, EventStream};
 use crossterm::execute;
-use dejay_core::protocol::DEFAULT_PORT;
+use vimj_core::protocol::DEFAULT_PORT;
 use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -29,8 +29,8 @@ struct Args {
 
 fn args() -> Result<Args> {
     let mut args = Args { port: DEFAULT_PORT, spawn: true };
-    if let Ok(port) = std::env::var("DEJAY_PORT") {
-        args.port = port.parse().context("DEJAY_PORT is not a port number")?;
+    if let Ok(port) = std::env::var("VIMJ_PORT") {
+        args.port = port.parse().context("VIMJ_PORT is not a port number")?;
     }
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -39,8 +39,8 @@ fn args() -> Result<Args> {
             "--no-spawn" => args.spawn = false,
             "--help" | "-h" => {
                 println!(
-                    "usage: dejay [--port PORT] [--no-spawn]\n\n\
-                     Terminal frontend for dejayd. Starts the daemon if it is not running,\n\
+                    "usage: vimj [--port PORT] [--no-spawn]\n\n\
+                     Terminal frontend for vimjd. Starts the daemon if it is not running,\n\
                      unless --no-spawn is given. Press ? inside for keys."
                 );
                 std::process::exit(0);
@@ -52,9 +52,9 @@ fn args() -> Result<Args> {
 }
 
 fn log_path() -> PathBuf {
-    let dir = dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("dejay");
+    let dir = dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("vimj");
     let _ = std::fs::create_dir_all(&dir);
-    dir.join("dejayd.log")
+    dir.join("vimjd.log")
 }
 
 /// Makes sure a daemon answers on the port, starting one if needed.
@@ -63,10 +63,10 @@ async fn ensure_daemon(client: &Client, args: &Args) -> Result<()> {
         return Ok(());
     }
     if !args.spawn {
-        bail!("dejayd is not running on port {}", args.port);
+        bail!("vimjd is not running on port {}", args.port);
     }
-    let sibling = std::env::current_exe()?.with_file_name("dejayd");
-    let program = if sibling.exists() { sibling } else { PathBuf::from("dejayd") };
+    let sibling = std::env::current_exe()?.with_file_name("vimjd");
+    let program = if sibling.exists() { sibling } else { PathBuf::from("vimjd") };
     let log_path = log_path();
     let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
     let mut command = Command::new(&program);
@@ -85,7 +85,7 @@ async fn ensure_daemon(client: &Client, args: &Args) -> Result<()> {
             return Ok(());
         }
     }
-    bail!("dejayd did not start; see {}", log_path.display())
+    bail!("vimjd did not start; see {}", log_path.display())
 }
 
 #[tokio::main]

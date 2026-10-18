@@ -7,8 +7,8 @@
 use crate::deck::Deck;
 use crate::dsp::{Smooth, soft_clip};
 use crate::pcm::Pcm;
-use dejay_core::model::Grid;
-use dejay_core::transition::{DeckFx, Timing, Transition};
+use vimj_core::model::Grid;
+use vimj_core::transition::{DeckFx, Timing, Transition};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -600,7 +600,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dejay_core::transition::{Effect, Eq, Preset, Volume};
+    use vimj_core::transition::{Effect, Eq, Preset, Volume};
 
     const RATE: u32 = 48_000;
 

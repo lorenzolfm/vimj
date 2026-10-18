@@ -1,8 +1,8 @@
 //! HTTP client for the daemon, plus the event stream listener.
 
 use anyhow::{Result, anyhow};
-use dejay_core::Transition;
-use dejay_core::protocol::*;
+use vimj_core::Transition;
+use vimj_core::protocol::*;
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

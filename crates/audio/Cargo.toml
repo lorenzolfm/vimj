@@ -1,12 +1,12 @@
 [package]
-name = "dejay-audio"
-description = "dejay's audio side: decoding, analysis (tempo, beats, key, energy, loudness) and the two-deck mix engine."
+name = "vimj-audio"
+description = "vimj's audio side: decoding, analysis (tempo, beats, key, energy, loudness) and the two-deck mix engine."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-dejay-core.workspace = true
+vimj-core.workspace = true
 anyhow.workspace = true
 realfft = "3"
 ebur128 = "0.1"

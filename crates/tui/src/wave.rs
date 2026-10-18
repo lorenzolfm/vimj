@@ -2,7 +2,7 @@
 //! low, mid, high) at `WAVEFORM_HZ`.
 
 use crate::theme;
-use dejay_core::protocol::WAVEFORM_HZ;
+use vimj_core::protocol::WAVEFORM_HZ;
 use ratatui::style::Color;
 
 const STRIDE: usize = 4;

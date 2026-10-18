@@ -3,10 +3,10 @@
 //!
 //! Plays 8 seconds of FROM before the window and 8 seconds of TO after it.
 
-use dejay_audio::engine::{Command, Engine, Entry, Plan, normalising_gain};
-use dejay_audio::{analysis, pcm};
-use dejay_core::compat::compat;
-use dejay_core::transition::{Preset, Side, auto_transition};
+use vimj_audio::engine::{Command, Engine, Entry, Plan, normalising_gain};
+use vimj_audio::{analysis, pcm};
+use vimj_core::compat::compat;
+use vimj_core::transition::{Preset, Side, auto_transition};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     let [from, to, out, rest @ ..] = args.as_slice() else {
         anyhow::bail!("usage: render FROM TO OUT.wav [PRESET] [BARS]");
     };
-    let load = |p: &str| -> anyhow::Result<(Arc<pcm::Pcm>, dejay_core::Analysis)> {
+    let load = |p: &str| -> anyhow::Result<(Arc<pcm::Pcm>, vimj_core::Analysis)> {
         let decoded = pcm::decode(Path::new("ffmpeg"), Path::new(p), RATE)?;
         let a = analysis::analyze(&decoded).analysis;
         Ok((Arc::new(decoded), a))
@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("{t:?}");
     eprintln!("{timing:?}");
 
-    let entry = |id: &str, analysis: &dejay_core::Analysis, next| Entry {
+    let entry = |id: &str, analysis: &vimj_core::Analysis, next| Entry {
         id: id.into(),
         path: PathBuf::from(id),
         grid: analysis.grid,

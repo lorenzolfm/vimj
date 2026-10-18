@@ -4,9 +4,9 @@
 
 use crate::app::App;
 use anyhow::{Context, Result, anyhow, bail};
-use dejay_core::meta::{Raw, song_name};
-use dejay_core::protocol::{Download, DownloadState, Event, Level, SongState};
-use dejay_core::Song;
+use vimj_core::meta::{Raw, song_name};
+use vimj_core::protocol::{Download, DownloadState, Event, Level, SongState};
+use vimj_core::Song;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,7 +17,7 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 
 /// Prefix of the progress lines yt-dlp is told to print.
-const PROGRESS: &str = "dejay-progress";
+const PROGRESS: &str = "vimj-progress";
 /// Pause between yt-dlp's requests to a site, and between songs. YouTube
 /// flags connections that fire requests quickly, which playlist imports would.
 const SLEEP_REQUESTS: &str = "0.5";
@@ -325,7 +325,7 @@ async fn expand_playlist(app: &Arc<App>, url: &str) -> Result<Outcome> {
         count += 1;
     }
     if count == 0 {
-        bail!("that playlist has no songs dejay can reach");
+        bail!("that playlist has no songs vimj can reach");
     }
     Ok(Outcome::Expanded { title: list.title.unwrap_or_else(|| "Playlist".into()), count })
 }
@@ -497,8 +497,8 @@ mod tests {
 
     #[test]
     fn parses_progress_lines() {
-        assert_eq!(parse_progress("dejay-progress 500 1000 NA 2048.5"), Some((0.5, Some(2048.5))));
-        assert_eq!(parse_progress("dejay-progress 500 NA 2000 NA"), Some((0.25, None)));
+        assert_eq!(parse_progress("vimj-progress 500 1000 NA 2048.5"), Some((0.5, Some(2048.5))));
+        assert_eq!(parse_progress("vimj-progress 500 NA 2000 NA"), Some((0.25, None)));
         assert_eq!(parse_progress("[download] Destination: x"), None);
     }
 

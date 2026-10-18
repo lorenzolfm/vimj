@@ -1,4 +1,4 @@
-//! Pure mixing logic shared by the dejay daemon, its audio engine and its
+//! Pure mixing logic shared by the vimj daemon, its audio engine and its
 //! frontends: keys, compatibility, smart reorder, transitions and wire types.
 //!
 //! Nothing in here does IO.

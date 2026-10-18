@@ -8,8 +8,8 @@
 //! chromagram correlated with major and minor key profiles.
 
 use crate::pcm::Pcm;
-use dejay_core::model::{Analysis, Grid, Key};
-use dejay_core::protocol::WAVEFORM_HZ;
+use vimj_core::model::{Analysis, Grid, Key};
+use vimj_core::protocol::WAVEFORM_HZ;
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 

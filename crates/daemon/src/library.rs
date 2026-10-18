@@ -6,12 +6,12 @@
 //! the same wherever it occurs; pairs nobody edited get an automatic one.
 
 use crate::config::{load_json, save_json};
-use dejay_audio::engine::{Entry, normalising_gain};
-use dejay_core::compat::{Compat, compat};
-use dejay_core::order;
-use dejay_core::protocol::*;
-use dejay_core::transition::{Side, auto_transition};
-use dejay_core::{Analysis, Song, Transition};
+use vimj_audio::engine::{Entry, normalising_gain};
+use vimj_core::compat::{Compat, compat};
+use vimj_core::order;
+use vimj_core::protocol::*;
+use vimj_core::transition::{Side, auto_transition};
+use vimj_core::{Analysis, Song, Transition};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -517,7 +517,7 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dejay_core::{Grid, Key};
+    use vimj_core::{Grid, Key};
 
     fn song(id: &str, bpm: f64, tonic: u8, energy: f32) -> Song {
         Song {

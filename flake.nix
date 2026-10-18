@@ -1,5 +1,5 @@
 {
-  description = "dejay: DJ-style transitions for your own music, from the terminal";
+  description = "vimj: DJ-style transitions for your own music, from the terminal";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -7,13 +7,13 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      # What dejay runs at play and download time.
+      # What vimj runs at play and download time.
       runtime = pkgs: [ pkgs.ffmpeg pkgs.yt-dlp ];
     in
     {
       packages = forAll (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
-          pname = "dejay";
+          pname = "vimj";
           version = "0.2.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -25,11 +25,11 @@
           # The tests need nothing special, but they double the build time.
           doCheck = false;
           postInstall = ''
-            for bin in dejay dejayd; do
+            for bin in vimj vimjd; do
               wrapProgram $out/bin/$bin --prefix PATH : ${pkgs.lib.makeBinPath (runtime pkgs)}
             done
           '';
-          meta.mainProgram = "dejay";
+          meta.mainProgram = "vimj";
         };
       });
 

@@ -5,9 +5,9 @@
 use crate::theme::{self, *};
 use crate::wave;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use dejay_core::model::{BEATS_PER_BAR, Grid};
-use dejay_core::protocol::{PlayerState, TransitionDetail};
-use dejay_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Preset, Transition, Volume};
+use vimj_core::model::{BEATS_PER_BAR, Grid};
+use vimj_core::protocol::{PlayerState, TransitionDetail};
+use vimj_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Preset, Transition, Volume};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -92,7 +92,7 @@ impl Editor {
     }
 
     fn grids(&self) -> (Option<Grid>, Option<Grid>) {
-        let grid = |s: &dejay_core::protocol::SongInfo| s.song.analysis.as_ref().and_then(|a| a.grid);
+        let grid = |s: &vimj_core::protocol::SongInfo| s.song.analysis.as_ref().and_then(|a| a.grid);
         self.detail.as_ref().map_or((None, None), |d| (grid(&d.from), grid(&d.to)))
     }
 
@@ -201,7 +201,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     let mut lines: Vec<Line> = Vec::new();
 
     // Header: the pair, and how well they match.
-    let song_label = |s: &dejay_core::protocol::SongInfo| {
+    let song_label = |s: &vimj_core::protocol::SongInfo| {
         let a = s.song.analysis.as_ref();
         let mut spans = vec![Span::styled(s.song.title.clone(), bold(text()))];
         if !s.song.artist.is_empty() {
@@ -410,7 +410,7 @@ fn beat_label(grid: Option<Grid>, ms: f64) -> String {
 }
 
 /// Where a looping preview is, in ms from the start of the window.
-fn preview_time(p: &PlayerState, t: &Transition, timing: &dejay_core::transition::Timing) -> Option<f64> {
+fn preview_time(p: &PlayerState, t: &Transition, timing: &vimj_core::transition::Timing) -> Option<f64> {
     match p.index {
         Some(0) => Some(p.position_ms - t.out_ms),
         Some(1) => Some(timing.duration_ms + (p.position_ms - timing.in_end_ms)),

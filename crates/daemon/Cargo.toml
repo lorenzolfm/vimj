@@ -1,13 +1,13 @@
 [package]
-name = "dejayd"
-description = "dejay daemon: library, yt-dlp downloads, analysis and the mix engine, behind a local HTTP API."
+name = "vimjd"
+description = "vimj daemon: library, yt-dlp downloads, analysis and the mix engine, behind a local HTTP API."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-dejay-core.workspace = true
-dejay-audio.workspace = true
+vimj-core.workspace = true
+vimj-audio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -59,7 +59,7 @@ impl EnergyMatch {
     }
 }
 
-/// What an unknown key, tempo or energy scores: dejay can't vouch for it, so
+/// What an unknown key, tempo or energy scores: vimj can't vouch for it, so
 /// songs analysis couldn't read rank below ones it could.
 const UNKNOWN: f32 = 0.25;
 

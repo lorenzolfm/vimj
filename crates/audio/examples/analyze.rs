@@ -1,6 +1,6 @@
 //! Prints what analysis finds in audio files: `cargo run --example analyze -- FILE...`
 
-use dejay_audio::{analysis, pcm};
+use vimj_audio::{analysis, pcm};
 use std::path::Path;
 
 fn main() {

@@ -4,10 +4,10 @@
 use crate::app::App;
 use crate::downloads::now;
 use anyhow::{Context, Result};
-use dejay_audio::{analysis, pcm};
-use dejay_core::meta::{Raw, from_file_name, song_name};
-use dejay_core::protocol::{Event, Level, SongState};
-use dejay_core::Song;
+use vimj_audio::{analysis, pcm};
+use vimj_core::meta::{Raw, from_file_name, song_name};
+use vimj_core::protocol::{Event, Level, SongState};
+use vimj_core::Song;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 const ANALYSIS_RATE: u32 = 48_000;
 const AUDIO_EXTENSIONS: [&str; 11] = ["opus", "ogg", "oga", "m4a", "mp3", "flac", "wav", "aac", "webm", "aiff", "wma"];
 
-/// Adds audio files nobody told dejay about, and flags songs whose file is gone.
+/// Adds audio files nobody told vimj about, and flags songs whose file is gone.
 pub fn rescan(app: &Arc<App>) -> Result<usize> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(&app.music_dir).with_context(|| format!("reading {}", app.music_dir.display()))? {

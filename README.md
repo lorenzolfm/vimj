@@ -1,7 +1,7 @@
-# dejay
+# vimj
 
 Spotify-style Mix for music you keep yourself, in the terminal: paste a YouTube link to download a
-song, then let dejay order your songs and blend each one into the next like a DJ.
+song, then let vimj order your songs and blend each one into the next like a DJ.
 
 - **Downloads**: paste a link (YouTube, YouTube Music, SoundCloud, Bandcamp and the
   [other sites yt-dlp knows](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)).
@@ -31,7 +31,7 @@ them first:
 git add -A
 nix develop            # pkg-config, ALSA, libclang, ffmpeg, yt-dlp
 cargo build --release
-./target/release/dejay
+./target/release/vimj
 ```
 
 or `nix run` / `nix profile install .`, which wraps ffmpeg and yt-dlp in.
@@ -41,19 +41,19 @@ or `nix run` / `nix profile install .`, which wraps ffmpeg and yt-dlp in.
 
 **macOS**: `brew install ffmpeg yt-dlp`, then `cargo build --release`.
 
-`dejay` starts the daemon, `dejayd`, in the background when it isn't running. Music keeps playing
+`vimj` starts the daemon, `vimjd`, in the background when it isn't running. Music keeps playing
 after you quit with `q`; `Q` quits and stops it.
 
 ## Getting songs in
 
-Paste a link anywhere (or `:add <link>`), and `gd` shows the downloads. Songs land in `~/Music/dejay`,
+Paste a link anywhere (or `:add <link>`), and `gd` shows the downloads. Songs land in `~/Music/vimj`,
 named `Artist - Title [id].ext`. Any audio file you drop in that folder is picked up as well at
 start or with `:rescan`.
 
 If YouTube answers with *"Sign in to confirm you're not a bot"*, let yt-dlp use your browser's
 YouTube login: `:cookies firefox` (or `chrome`, `brave`, `edge`, `safari`…); `:cookies off` undoes it.
 
-YouTube's best audio for most videos is Opus at about 130 kbps. dejay keeps that stream untouched;
+YouTube's best audio for most videos is Opus at about 130 kbps. vimj keeps that stream untouched;
 converting it to FLAC or 320 kbps MP3 would only make the file bigger.
 
 ## Keys
@@ -126,21 +126,21 @@ a filter, and a tempo-synced echo; the master has a soft clipper.
 ## Layout
 
 ```
-crates/core    dejay-core   keys, compatibility, smart reorder, transition curves, wire types
-crates/audio   dejay-audio  ffmpeg decoding, analysis, decks, the mix engine, sound output
-crates/daemon  dejayd       library, playlists, yt-dlp downloads, HTTP API + server-sent events
-crates/tui     dejay        ratatui frontend
+crates/core    vimj-core   keys, compatibility, smart reorder, transition curves, wire types
+crates/audio   vimj-audio  ffmpeg decoding, analysis, decks, the mix engine, sound output
+crates/daemon  vimjd       library, playlists, yt-dlp downloads, HTTP API + server-sent events
+crates/tui     vimj        ratatui frontend
 ```
 
-Frontends talk to `dejayd` over HTTP on `127.0.0.1:8787`; `dejay_core::protocol` has the requests,
+Frontends talk to `vimjd` over HTTP on `127.0.0.1:8787`; `vimj_core::protocol` has the requests,
 responses and the events streamed from `GET /api/events`, so a web or desktop frontend can reuse it.
 
-State lives in `~/.config/dejay/config.toml` (music folder, tool paths, browser for cookies, volume)
-and `~/.local/share/dejay/` (the library, waveforms, `dejayd.log`).
+State lives in `~/.config/vimj/config.toml` (music folder, tool paths, browser for cookies, volume)
+and `~/.local/share/vimj/` (the library, waveforms, `vimjd.log`).
 
-`cargo run --release -p dejay-audio --example analyze -- FILE…` prints what analysis finds in files;
-`--example render -- FROM TO OUT.wav [PRESET] [BARS]` renders a transition to listen to. `dejayd
---silent` (or `DEJAY_AUDIO=null`) plays into nothing, for testing.
+`cargo run --release -p vimj-audio --example analyze -- FILE…` prints what analysis finds in files;
+`--example render -- FROM TO OUT.wav [PRESET] [BARS]` renders a transition to listen to. `vimjd
+--silent` (or `VIMJ_AUDIO=null`) plays into nothing, for testing.
 
 ```sh
 cargo test --workspace

@@ -3,7 +3,7 @@
 
 use crate::dsp::{Echo, Eq3, Filter, Smooth};
 use crate::pcm::Pcm;
-use dejay_core::transition::DeckFx;
+use vimj_core::transition::DeckFx;
 use signalsmith_stretch::Stretch;
 use std::sync::Arc;
 
