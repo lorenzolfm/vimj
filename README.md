@@ -45,7 +45,8 @@ or `nix run` / `nix profile install .`, which wraps ffmpeg and yt-dlp in.
 **macOS**: `brew install ffmpeg yt-dlp`, then `cargo build --release`.
 
 `vimj` starts the daemon, `vimjd`, in the background when it isn't running. Music keeps playing
-after you quit with `q`; `Q` quits and stops it.
+after you quit with `q`; `Q` quits and stops it. If something else answers on the port, say a
+`vimjd` from an older build, `vimj` says so and stops rather than talk to it.
 
 ## Getting songs in
 
@@ -199,6 +200,8 @@ crates/tui     vimj        ratatui frontend
 
 Frontends talk to `vimjd` over HTTP on `127.0.0.1:8787`; `vimj_core::protocol` has the requests,
 responses and the events streamed from `GET /api/events`, so a web or desktop frontend can reuse it.
+`GET /api/status` names the `protocol` the daemon speaks (`vimj_core::protocol::PROTOCOL`); talk
+only to a daemon whose protocol is your own.
 
 State lives in `~/.config/vimj/config.toml` (music folder, tool paths, browser for cookies, volume)
 and `~/.local/share/vimj/` (the library, waveforms, `vimjd.log`). If `vimjd` can't read the library,
