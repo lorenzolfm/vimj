@@ -6,7 +6,7 @@ use crate::library::Library;
 use crate::playback::Playback;
 use anyhow::Result;
 use vimj_audio::player::Output;
-use vimj_core::protocol::{ConfigUpdate, Event, Level, PlayerState, Status};
+use vimj_core::protocol::{ConfigUpdate, Event, Level, PROTOCOL, PlayerState, Status};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, broadcast};
@@ -99,6 +99,7 @@ impl App {
         let tools = self.tools.lock().expect("tools lock").clone();
         let cookies_from_browser = self.config.lock().expect("config lock").cookies_from_browser.clone();
         Status {
+            protocol: PROTOCOL,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             music_dir: self.music_dir.display().to_string(),
             yt_dlp: tools.yt_dlp,

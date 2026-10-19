@@ -7,6 +7,9 @@ use crate::transition::{Timing, Transition};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PORT: u16 = 8787;
+/// What the daemon's [`Status`] says it speaks. Bumped whenever the API
+/// changes so that frontends and daemons of different builds can't talk.
+pub const PROTOCOL: u32 = 1;
 /// Playlist id of the whole library, which can be ordered and mixed like any playlist.
 pub const LIBRARY_ID: &str = "library";
 /// How many suggestions the "transition to…" menu offers.
@@ -16,6 +19,9 @@ pub const WAVEFORM_HZ: f64 = 100.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Status {
+    /// [`PROTOCOL`] as the daemon was built. Frontends talk only to a daemon
+    /// that speaks theirs, and take one without it for another program.
+    pub protocol: u32,
     pub version: String,
     pub music_dir: String,
     /// `yt-dlp --version`, or `None` when it can't be run.

@@ -11,10 +11,10 @@ mod wave;
 
 use anyhow::{Context, Result, bail};
 use app::{App, Msg};
-use client::Client;
+use client::{Answer, Client};
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, EventStream};
 use crossterm::execute;
-use vimj_core::protocol::DEFAULT_PORT;
+use vimj_core::protocol::{DEFAULT_PORT, PROTOCOL};
 use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -58,10 +58,21 @@ fn log_path() -> PathBuf {
     dir.join("vimjd.log")
 }
 
-/// Makes sure a daemon answers on the port, starting one if needed.
+/// Makes sure this build's vimjd answers on the port, starting one if
+/// nothing does. Anything else there is an error, not a daemon to talk to.
 async fn ensure_daemon(client: &Client, args: &Args) -> Result<()> {
-    if client.status().await.is_ok() {
-        return Ok(());
+    let port = args.port;
+    match client.identify().await {
+        Answer::Vimjd => return Ok(()),
+        Answer::Nobody => {}
+        Answer::OtherBuild(protocol) => bail!(
+            "the vimjd on port {port} is from another vimj build (protocol {protocol}; this one speaks {PROTOCOL}). \
+             Stop it with `pkill vimjd`, then start vimj again"
+        ),
+        Answer::Stranger => bail!(
+            "something on port {port} answers, but not as a vimjd this vimj can talk to: an older vimjd, or another \
+             program. Stop it, or use another port with --port or VIMJ_PORT"
+        ),
     }
     if !args.spawn {
         bail!("vimjd is not running on port {}", args.port);
@@ -82,7 +93,7 @@ async fn ensure_daemon(client: &Client, args: &Args) -> Result<()> {
     let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if client.status().await.is_ok() {
+        if client.identify().await == Answer::Vimjd {
             return Ok(());
         }
     }

@@ -4,10 +4,27 @@ use anyhow::{Result, anyhow};
 use vimj_core::Transition;
 use vimj_core::protocol::*;
 use futures_util::StreamExt;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// How long whatever answers on the port gets to say what it is.
+const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What answers on the daemon's port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// Nothing listens there.
+    Nobody,
+    /// A vimjd that speaks this build's protocol.
+    Vimjd,
+    /// A vimjd from a build that speaks another protocol.
+    OtherBuild(u32),
+    /// Something that doesn't say it is a vimjd: another program, or a vimjd
+    /// from before daemons said which protocol they speak.
+    Stranger,
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -56,8 +73,22 @@ impl Client {
         self.send(self.http.delete(self.url(path))).await
     }
 
-    pub async fn status(&self) -> Result<Status> {
-        self.get("/api/status").await
+    /// What answers on the daemon's port, going by the protocol its status names.
+    pub async fn identify(&self) -> Answer {
+        #[derive(Deserialize)]
+        struct Hello {
+            protocol: Option<u32>,
+        }
+        let response = match self.http.get(self.url("/api/status")).timeout(IDENTIFY_TIMEOUT).send().await {
+            Ok(response) => response,
+            Err(e) if e.is_connect() => return Answer::Nobody,
+            Err(_) => return Answer::Stranger,
+        };
+        match serde_json::from_slice(&response.bytes().await.unwrap_or_default()) {
+            Ok(Hello { protocol: Some(PROTOCOL) }) => Answer::Vimjd,
+            Ok(Hello { protocol: Some(other) }) => Answer::OtherBuild(other),
+            _ => Answer::Stranger,
+        }
     }
 
     pub async fn update_config(&self, update: ConfigUpdate) -> Result<Status> {
@@ -185,14 +216,17 @@ impl Client {
     }
 
     /// Streams daemon events into `tx`, reconnecting forever. Sends
-    /// `on_connect(true/false)` as the connection comes and goes.
+    /// `on_connect(true/false)` as the connection comes and goes; anything
+    /// but this build's vimjd on the port counts as no connection.
     pub fn listen<M: Send + 'static>(&self, tx: UnboundedSender<M>, on_event: fn(Event) -> M, on_connect: fn(bool) -> M) {
         let url = self.url("/api/events");
+        let client = self.clone();
         tokio::spawn(async move {
             // No timeout: the stream stays open.
             let http = reqwest::Client::new();
             loop {
-                if let Ok(response) = http.get(&url).send().await
+                if client.identify().await == Answer::Vimjd
+                    && let Ok(response) = http.get(&url).send().await
                     && response.status().is_success()
                 {
                     let _ = tx.send(on_connect(true));
@@ -242,5 +276,48 @@ mod tests {
         assert_eq!(parse_sse(block), Some(Event::Playlist { id: "p1".into() }));
         assert_eq!(parse_sse(b":keep-alive\n\n"), None);
         assert_eq!(find_blank_line(b"data: x\n\ndata: y"), Some(7));
+    }
+
+    /// What a client makes of a port where something answers `/api/status`
+    /// with `body`, or where nothing listens when there is no body.
+    async fn answer(body: Option<String>) -> Answer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        match body {
+            None => drop(listener),
+            Some(body) => {
+                tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let _ = socket.read(&mut [0; 1024]).await;
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    socket.write_all((head + &body).as_bytes()).await.unwrap();
+                });
+            }
+        }
+        Client::new(port).unwrap().identify().await
+    }
+
+    #[tokio::test]
+    async fn only_a_vimjd_speaking_this_protocol_is_taken_for_the_daemon() {
+        let status = |protocol| {
+            let status = Status {
+                protocol,
+                version: "0.2.0".into(),
+                music_dir: "/music".into(),
+                yt_dlp: None,
+                ffmpeg: true,
+                audio: Ok("Default Audio Device".into()),
+                cookies_from_browser: None,
+            };
+            Some(serde_json::to_string(&status).unwrap())
+        };
+        assert_eq!(answer(status(PROTOCOL)).await, Answer::Vimjd);
+        assert_eq!(answer(status(PROTOCOL + 1)).await, Answer::OtherBuild(PROTOCOL + 1));
+        // The daemon from before the rename to vimj: the same status, with no protocol in it.
+        let dejayd = r#"{"version":"0.2.0","music_dir":"/music","yt_dlp":null,"ffmpeg":true,"audio":{"Ok":"Default Audio Device"},"cookies_from_browser":null}"#;
+        assert_eq!(answer(Some(dejayd.into())).await, Answer::Stranger);
+        assert_eq!(answer(Some("<h1>It works!</h1>".into())).await, Answer::Stranger);
+        assert_eq!(answer(None).await, Answer::Nobody);
     }
 }
