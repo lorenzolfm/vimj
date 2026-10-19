@@ -3,6 +3,7 @@
 
 use crate::app::{App, Confirm, Focus, Mode, Popup, View};
 use crate::editor;
+use crate::mouse::{self, Hits, Target};
 use crate::theme::*;
 use crate::wave;
 use vimj_core::compat::{Compat, TempoRelation};
@@ -18,6 +19,7 @@ const SIDEBAR_WIDTH: u16 = 28;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
+    app.hits.clear();
     frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), screen);
     let [top, player, status] = Layout::vertical([Constraint::Min(5), Constraint::Length(4), Constraint::Length(1)]).areas(screen);
     if app.editor.is_some() {
@@ -32,12 +34,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_player(frame, player, app);
     draw_status(frame, status, app);
-    if let Some(popup) = &app.popup {
-        match popup {
-            Popup::Help => draw_help(frame, screen),
-            Popup::Suggestions(_) => draw_suggestions(frame, screen, app),
-            Popup::AddTo(_) => draw_add_to(frame, screen, app),
-        }
+    match app.popup {
+        Some(Popup::Help) => draw_help(frame, screen, &mut app.hits),
+        Some(Popup::Suggestions(_)) => draw_suggestions(frame, screen, app),
+        Some(Popup::AddTo(_)) => draw_add_to(frame, screen, app),
+        None => {}
     }
 }
 
@@ -85,6 +86,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = panel("vimj", focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.hits.add(area, Target::Pane(Focus::Sidebar));
     let width = inner.width as usize;
     let playing_context = app.player.as_ref().filter(|p| p.status != PlayerStatus::Stopped).and_then(|p| p.context.clone());
     let active_downloads = app.downloads.iter().filter(|d| !matches!(d.state, DownloadState::Done | DownloadState::Failed)).count();
@@ -112,6 +114,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
         if focused && i == app.side {
             line = line.style(Style::new().bg(HIGHLIGHT));
         }
+        app.hits.add(mouse::rows(inner, lines.len(), 1), Target::Side(i));
         lines.push(line);
     }
     if app.playlists.as_ref().is_some_and(|p| p.playlists.is_empty()) {
@@ -130,9 +133,9 @@ impl Columns {
     /// marker 2, number 5, bpm 6, key 4, energy 2, time 6, spacing
     const FIXED: usize = 27;
 
-    fn new(width: u16, mix: bool) -> Columns {
+    fn new(width: u16) -> Columns {
         let width = width as usize;
-        let link = if mix && width > 90 { 26 } else { 0 };
+        let link = if width > 90 { 26 } else { 0 };
         let flexible = width.saturating_sub(Columns::FIXED + link);
         let title = flexible * 55 / 100;
         Columns { title, artist: flexible - title, link }
@@ -141,6 +144,7 @@ impl Columns {
 
 fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Main;
+    app.hits.add(area, Target::Pane(Focus::Main));
     let Some(list) = app.list.as_ref().filter(|l| Some(l.id.as_str()) == app.current_id()) else {
         frame.render_widget(panel("Library", focused), area);
         let inner = area.inner(ratatui::layout::Margin::new(2, 1));
@@ -153,13 +157,10 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, area);
     let [header, columns_row, rows_area] = Layout::vertical([Constraint::Length(2), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
-    // Header: counts, mix state, hints.
+    // Header: counts, hints.
     let total: u64 = list.songs.iter().map(|s| s.song.duration_ms).sum();
     let analysing = list.songs.iter().filter(|s| s.state == SongState::Analyzing).count();
-    let mut summary = vec![
-        Span::styled(format!(" {} · {}", plural(list.songs.len(), "song"), long_duration(total)), subtle()),
-        Span::styled(if list.mix { "  ·  Mix on" } else { "  ·  Mix off" }, if list.mix { accent() } else { dim() }),
-    ];
+    let mut summary = vec![Span::styled(format!(" {} · {}", plural(list.songs.len(), "song"), long_duration(total)), subtle())];
     if analysing > 0 {
         summary.push(Span::styled(format!("  ·  analysing {analysing}"), Style::new().fg(WARN)));
     }
@@ -168,11 +169,11 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     } else if list.songs.is_empty() {
         " Empty. Yank songs in the library (yy, or V to select) and put them here with p, or press a on them."
     } else {
-        " t next-song ideas · e edit transition · s smart reorder · m mix · V select · ? help"
+        " t next-song ideas · e edit transition · s smart reorder · V select · ? help"
     };
     frame.render_widget(Paragraph::new(vec![Line::from(summary), Line::styled(hints, dim())]), header);
 
-    let cols = Columns::new(inner.width, list.mix);
+    let cols = Columns::new(inner.width);
     let head = format!(
         "  {:>3}  {}{}{:>5} {:>4} E  {:>5}  {}",
         "#",
@@ -188,7 +189,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let height = rows_area.height as usize;
     app.page = height;
     app.list_area = rows_area;
-    app.offset = scroll_to(app.offset, app.cursor, height, 3);
+    app.offset = scroll_to(app.offset, app.cursor, height, app.margin);
     let playing = app.player.as_ref().filter(|p| p.status != PlayerStatus::Stopped && p.context.as_deref() == Some(&list.id));
     let playing_index = playing.and_then(|p| p.index);
     let mixing_into = playing.and_then(|p| p.mixing.as_ref()).and(playing_index.map(|i| i + 1));
@@ -240,9 +241,13 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
             energy,
             Span::styled(format!(" {:>5}  ", clock(song.duration_ms as f64)), dim()),
         ];
+        let row = mouse::rows(rows_area, i - app.offset, 1);
+        app.hits.add(row, Target::Song(i));
         if cols.link > 0
             && let Some(link) = list.links.get(i)
         {
+            let x: usize = spans.iter().map(Span::width).sum();
+            app.hits.add(mouse::columns(row, x, cols.link), Target::Link(i));
             let t = &link.transition;
             let (glyph, color) = quality(link.compat.score);
             spans.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
@@ -307,6 +312,7 @@ fn draw_downloads(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = panel("Downloads", app.focus == Focus::Main);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    app.hits.add(area, Target::Pane(Focus::Main));
     let width = inner.width as usize;
     let mut lines = vec![
         Line::styled(" Paste a link (YouTube, YouTube Music, SoundCloud, Bandcamp…) or :add <link>. Playlists work too.", dim()),
@@ -328,6 +334,7 @@ fn draw_downloads(frame: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::styled("   Nothing downloading.", dim()));
     }
     for (i, d) in app.downloads.iter().enumerate() {
+        let first = lines.len();
         let (icon, color, state) = match d.state {
             DownloadState::Queued => ("·", DIM, "queued".to_owned()),
             DownloadState::Resolving => ("…", WARN, "looking up".to_owned()),
@@ -361,6 +368,7 @@ fn draw_downloads(frame: &mut Frame, area: Rect, app: &mut App) {
             let style = if d.state == DownloadState::Failed { Style::new().fg(ERROR) } else { dim() };
             lines.push(Line::styled(format!("     {}", fit(e, width.saturating_sub(6))), style));
         }
+        app.hits.add(mouse::rows(inner, first, lines.len() - first), Target::Download(i));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -401,9 +409,14 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &mut App) {
     if p.preview {
         spans.push(Span::styled("   previewing a transition", Style::new().fg(PURPLE)));
     }
+    let (icon_width, title_width) = (spans[0].width(), spans[1].width() + spans[2].width());
+    app.hits.add(mouse::columns(info, 0, icon_width), Target::Toggle);
+    app.hits.add(mouse::columns(info, icon_width, title_width), Target::Playing);
     let volume = format!("vol {:>3}%  ", p.volume);
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
     spans.push(Span::raw(" ".repeat((info.width as usize).saturating_sub(used + volume.len()))));
+    let x: usize = spans.iter().map(Span::width).sum();
+    app.hits.add(mouse::columns(info, x, volume.len()), Target::Volume);
     spans.push(Span::styled(volume, dim()));
     frame.render_widget(Paragraph::new(Line::from(spans)), info);
 
@@ -416,6 +429,7 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &mut App) {
         (tm.out_start_ms, tm.out_end_ms)
     });
     let mut spans = vec![Span::styled(format!("  {:>5} ", clock(position)), subtle())];
+    app.hits.add(mouse::columns(wave_row, spans[0].width(), width), Target::Seek);
     for c in 0..width {
         let (from, to) = (duration * c as f64 / width as f64, duration * (c + 1) as f64 / width as f64);
         let played = to <= position;
@@ -512,12 +526,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_editor(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(ed) = &app.editor else { return };
     let block = panel("Transition", true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    editor::draw(frame, inner, ed, &app.waveforms, app.player.as_ref());
+    editor::draw(frame, inner, ed, &app.waveforms, app.player.as_ref(), &mut app.hits);
 }
 
 fn centered(screen: Rect, width: u16, height: u16) -> Rect {
@@ -535,10 +549,12 @@ fn modal(title: &str) -> Block<'static> {
         .style(Style::new().bg(Color::Rgb(28, 28, 28)))
 }
 
-fn draw_suggestions(frame: &mut Frame, screen: Rect, app: &App) {
+fn draw_suggestions(frame: &mut Frame, screen: Rect, app: &mut App) {
     let Some(Popup::Suggestions(p)) = &app.popup else { return };
     let area = centered(screen, 96, 18);
     clear(frame, area);
+    app.hits.add(screen, Target::Backdrop);
+    app.hits.add(area, Target::Popup);
     let block = modal(&format!("Best next songs after {}", p.anchor_title));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -549,6 +565,7 @@ fn draw_suggestions(frame: &mut Frame, screen: Rect, app: &App) {
         Some(items) if items.is_empty() => lines.push(Line::styled(" No other songs yet.", dim())),
         Some(items) => {
             for (i, s) in items.iter().enumerate() {
+                let first = lines.len();
                 let song = &s.song.song;
                 let a = song.analysis.as_ref();
                 let (glyph, color) = quality(s.compat.score);
@@ -578,19 +595,22 @@ fn draw_suggestions(frame: &mut Frame, screen: Rect, app: &App) {
                     detail.extend(compat_spans(&s.compat).into_iter().skip(1));
                     lines.push(Line::from(detail));
                 }
+                app.hits.add(mouse::rows(inner, first, lines.len() - first), Target::Suggestion(i));
             }
         }
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(" j/k choose · Enter or 1-5 put it next · Esc close", dim()));
+    lines.push(Line::styled(" j/k choose · Enter, 1-5 or double-click put it next · Esc close", dim()));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_add_to(frame: &mut Frame, screen: Rect, app: &App) {
-    let Some(Popup::AddTo(p)) = &app.popup else { return };
+fn draw_add_to(frame: &mut Frame, screen: Rect, app: &mut App) {
     let targets = app.add_targets();
+    let Some(Popup::AddTo(p)) = &app.popup else { return };
     let area = centered(screen, 46, targets.len() as u16 + 5);
     clear(frame, area);
+    app.hits.add(screen, Target::Backdrop);
+    app.hits.add(area, Target::Popup);
     let block = modal(&format!("Add {} to", plural(p.songs.len(), "song")));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -601,6 +621,7 @@ fn draw_add_to(frame: &mut Frame, screen: Rect, app: &App) {
         if i == p.cursor {
             line = line.style(Style::new().bg(HIGHLIGHT));
         }
+        app.hits.add(mouse::rows(inner, lines.len(), 1), Target::AddTo(i));
         lines.push(line);
     }
     lines.push(Line::raw(""));
@@ -608,7 +629,7 @@ fn draw_add_to(frame: &mut Frame, screen: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &[(&str, &str)]); 5] = [
+const HELP: [(&str, &[(&str, &str)]); 6] = [
     ("Move", &[
         ("j k  ↓ ↑", "down, up (with a count: 5j)"),
         ("gg G  12G", "top, bottom, line 12"),
@@ -625,11 +646,18 @@ const HELP: [(&str, &[(&str, &str)]); 5] = [
         ("a", "add to a playlist"),
         ("u  C-r", "undo, redo"),
     ]),
+    ("Mouse", &[
+        ("click", "pick a song, open a playlist"),
+        ("double-click", "play from here"),
+        ("drag", "select songs"),
+        ("wheel", "scroll; over vol, volume"),
+        ("click INTO NEXT", "edit that transition"),
+        ("click the waveform, ▶", "seek, pause"),
+    ]),
     ("Mix", &[
         ("t", "five best next songs, from the library"),
         ("e", "edit the transition after this song"),
         ("s", "smart reorder"),
-        ("m", "mix on or off"),
     ]),
     ("Play", &[
         ("Enter  space", "play from here, pause"),
@@ -643,11 +671,12 @@ const HELP: [(&str, &[(&str, &str)]); 5] = [
         (":title :artist", "rename the song"),
         (":cookies <browser>", "use its YouTube login"),
         (":rescan :clear", "pick up files, tidy downloads"),
+        (":w  :q  :q!  :e!", "in the transition editor"),
         ("q  Q", "quit, quit and stop music"),
     ]),
 ];
 
-fn draw_help(frame: &mut Frame, screen: Rect) {
+fn draw_help(frame: &mut Frame, screen: Rect, hits: &mut Hits) {
     let column = |sections: &[(&str, &[(&str, &str)])]| -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for (section, keys) in sections {
@@ -659,19 +688,24 @@ fn draw_help(frame: &mut Frame, screen: Rect) {
         }
         lines
     };
-    let (left, right) = (column(&HELP[..2]), column(&HELP[2..]));
-    let rows = left.len().max(right.len()) as u16 + 4;
+    let (left, right) = (column(&HELP[..3]), column(&HELP[3..]));
+    let rows = left.len().max(right.len()) as u16 + 5;
     let area = centered(screen, 124, rows);
     clear(frame, area);
+    // A click anywhere closes it.
+    hits.add(screen, Target::Backdrop);
     let block = modal("Keys");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
     let [l, r] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
     frame.render_widget(Paragraph::new(left), l);
     frame.render_widget(Paragraph::new(right), r);
     frame.render_widget(
-        Paragraph::new(Line::styled(" Transition editor: j/k field · h/l change · space preview loop · [ ] other pairs · esc close", dim())),
+        Paragraph::new(vec![
+            Line::styled(" Transition editor: j/k field · h/l change · space preview loop · [ ] other pairs · :w save · :q close", dim()),
+            Line::styled(" With the mouse: click a field or its ‹ ›, turn the wheel over it, or drag a waveform to move it by beats", dim()),
+        ]),
         foot,
     );
 }

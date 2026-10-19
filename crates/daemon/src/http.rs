@@ -74,7 +74,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/transitions/{from}/{to}", get(transition).put(set_transition).delete(reset_transition))
         .route("/api/player", get(player))
         .route("/api/player/play", post(play))
-        .route("/api/player/preview", post(preview))
+        .route("/api/player/preview", post(preview).put(update_preview))
         .route("/api/player/toggle", post(toggle))
         .route("/api/player/stop", post(stop))
         .route("/api/player/next", post(next))
@@ -285,7 +285,15 @@ async fn play(State(app): Shared, Json(req): Json<PlayRequest>) -> ApiResult<Pla
 async fn preview(State(app): Shared, Json(req): Json<PreviewRequest>) -> ApiResult<PlayerState> {
     {
         let lib = app.lib.lock().expect("library lock");
-        app.playback.preview(&lib, &app.music_dir, &req.from, &req.to, req.lead_in_ms)?;
+        app.playback.preview(&lib, &app.music_dir, &req.from, &req.to, req.lead_in_ms, req.transition)?;
+    }
+    Ok(Json(app.player_state()))
+}
+
+async fn update_preview(State(app): Shared, Json(t): Json<Transition>) -> ApiResult<PlayerState> {
+    {
+        let lib = app.lib.lock().expect("library lock");
+        app.playback.update_preview(&lib, &app.music_dir, t)?;
     }
     Ok(Json(app.player_state()))
 }

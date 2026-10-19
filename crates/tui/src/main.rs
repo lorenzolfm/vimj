@@ -4,6 +4,7 @@
 mod app;
 mod client;
 mod editor;
+mod mouse;
 mod theme;
 mod ui;
 mod wave;

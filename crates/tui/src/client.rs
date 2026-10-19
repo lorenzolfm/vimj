@@ -157,8 +157,14 @@ impl Client {
         self.post("/api/player/play", &PlayRequest { context, index, position_ms }).await
     }
 
-    pub async fn preview(&self, from: String, to: String, lead_in_ms: f64) -> Result<PlayerState> {
-        self.post("/api/player/preview", &PreviewRequest { from, to, lead_in_ms }).await
+    /// Loops a transition: `transition`, or the stored one.
+    pub async fn preview(&self, from: String, to: String, lead_in_ms: f64, transition: Option<Transition>) -> Result<PlayerState> {
+        self.post("/api/player/preview", &PreviewRequest { from, to, lead_in_ms, transition }).await
+    }
+
+    /// Changes what the running preview plays, without starting it over.
+    pub async fn update_preview(&self, t: &Transition) -> Result<PlayerState> {
+        self.send(self.http.put(self.url("/api/player/preview")).json(t)).await
     }
 
     /// toggle, stop, next or previous.
