@@ -58,7 +58,6 @@ pub struct PlaylistSummary {
     pub name: String,
     pub count: usize,
     pub duration_ms: u64,
-    pub mix: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -78,8 +77,6 @@ pub struct Link {
 pub struct PlaylistView {
     pub id: String,
     pub name: String,
-    /// Transitions are played; off means songs play back to back.
-    pub mix: bool,
     pub songs: Vec<SongInfo>,
     /// `links[i]` joins `songs[i]` and `songs[i + 1]`.
     pub links: Vec<Link>,
@@ -104,6 +101,8 @@ pub struct TransitionDetail {
     pub timing: Timing,
     /// Hand-edited and stored, rather than generated.
     pub saved: bool,
+    /// What vimj picks for the pair by itself, which resetting goes back to.
+    pub automatic: Transition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +219,6 @@ pub struct CreatePlaylist {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PlaylistUpdate {
     pub name: Option<String>,
-    pub mix: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,6 +262,9 @@ pub struct PreviewRequest {
     /// How much of the outgoing song plays before the window.
     #[serde(default = "default_lead")]
     pub lead_in_ms: f64,
+    /// Play this rather than the stored transition, for edits not saved yet.
+    #[serde(default)]
+    pub transition: Option<Transition>,
 }
 
 fn default_lead() -> f64 {

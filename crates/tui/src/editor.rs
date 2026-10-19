@@ -1,13 +1,15 @@
 //! The transition editor: both songs' waveforms lined up on one timeline,
 //! the volume, EQ and effect curves under them, and a field list edited the
-//! vim way: `j`/`k` pick a field, `h`/`l` change it.
+//! vim way: `j`/`k` pick a field, `h`/`l` change it. Edits stay in a draft
+//! until `:w` stores them, as in a vim buffer.
 
+use crate::mouse::{self, Hits, Target};
 use crate::theme::{self, *};
 use crate::wave;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use vimj_core::model::{BEATS_PER_BAR, Grid};
-use vimj_core::protocol::{PlayerState, TransitionDetail};
-use vimj_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Preset, Transition, Volume};
+use vimj_core::protocol::{PlayerState, SongInfo, TransitionDetail};
+use vimj_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Preset, Side, Transition, Volume};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -17,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Edits are sent to the daemon this long after the last key press.
-const SAVE_AFTER: Duration = Duration::from_millis(300);
+/// A running preview picks up edits this long after the last one.
+const PREVIEW_AFTER: Duration = Duration::from_millis(300);
 /// Fine nudge for lining beats up by ear.
 const NUDGE_MS: f64 = 10.0;
 /// The outgoing song plays this long before the window when previewing.
@@ -42,57 +44,110 @@ pub struct Editor {
     /// The pair is `songs[index]` → `songs[index + 1]`.
     pub index: usize,
     pub count: usize,
+    from: String,
+    to: String,
+    /// The pair as stored.
     pub detail: Option<TransitionDetail>,
+    /// The transition being edited, which `:w` stores.
     pub draft: Option<Transition>,
     pub field: Field,
-    dirty_since: Option<Instant>,
+    /// When the draft last changed, until a running preview hears of it.
+    changed_at: Option<Instant>,
     /// The last edit moved the window, so a running preview should start over.
-    pub restart_preview: bool,
+    restart_preview: bool,
     pub previewing: bool,
 }
 
 pub enum Action {
     None,
     Close,
-    Reset,
+    Command,
     TogglePreview,
     /// Move to the pair this many places away.
     Pair(isize),
 }
 
 impl Editor {
-    pub fn new(index: usize, count: usize) -> Editor {
-        Editor { index, count, detail: None, draft: None, field: Field::Preset, dirty_since: None, restart_preview: false, previewing: false }
+    pub fn new(index: usize, count: usize, from: String, to: String) -> Editor {
+        Editor { index, count, from, to, detail: None, draft: None, field: Field::Preset, changed_at: None, restart_preview: false, previewing: false }
+    }
+
+    pub fn pair(&self) -> (String, String) {
+        (self.from.clone(), self.to.clone())
+    }
+
+    pub fn is_pair(&self, detail: &TransitionDetail) -> bool {
+        detail.from.song.id == self.from && detail.to.song.id == self.to
     }
 
     pub fn loaded(&mut self, detail: TransitionDetail) {
-        // Keep local edits that haven't been saved yet.
-        if self.dirty_since.is_none() {
+        if !self.is_pair(&detail) {
+            return;
+        }
+        if self.draft.is_none() {
             self.draft = Some(detail.transition.clone());
         }
         self.detail = Some(detail);
     }
 
-    pub fn pair(&self) -> Option<(String, String)> {
-        self.detail.as_ref().map(|d| (d.from.song.id.clone(), d.to.song.id.clone()))
+    /// `sent` was stored as `detail`. The draft takes on what the daemon
+    /// made of it, unless it has been edited again since.
+    pub fn saved(&mut self, detail: TransitionDetail, sent: &Transition) {
+        if !self.is_pair(&detail) {
+            return;
+        }
+        if self.draft.as_ref() == Some(sent) {
+            self.draft = Some(detail.transition.clone());
+        }
+        self.detail = Some(detail);
     }
 
-    /// The draft to save, once edits have settled.
-    pub fn due(&mut self) -> Option<Transition> {
-        let since = self.dirty_since?;
-        if since.elapsed() < SAVE_AFTER {
+    /// The draft differs from what is stored.
+    pub fn modified(&self) -> bool {
+        matches!((&self.detail, &self.draft), (Some(d), Some(t)) if d.transition != *t)
+    }
+
+    /// Throws the edits away.
+    pub fn revert(&mut self) {
+        if let Some(d) = &self.detail {
+            self.replace(d.transition.clone());
+        }
+    }
+
+    /// Goes back to the transition vimj would pick by itself.
+    pub fn reset(&mut self) {
+        if let Some(d) = &self.detail {
+            self.replace(d.automatic.clone());
+        }
+    }
+
+    fn replace(&mut self, t: Transition) {
+        self.draft = Some(t);
+        self.changed_at = Some(Instant::now());
+        self.restart_preview = true;
+    }
+
+    /// Starts previewing; returns what to play.
+    pub fn start_preview(&mut self) -> Option<Transition> {
+        let t = self.draft.clone()?;
+        self.previewing = true;
+        self.changed_at = None;
+        self.restart_preview = false;
+        Some(t)
+    }
+
+    /// The draft for a running preview to play, once edits have settled,
+    /// and whether the preview should start over.
+    pub fn preview_due(&mut self) -> Option<(Transition, bool)> {
+        if !self.previewing || self.changed_at?.elapsed() < PREVIEW_AFTER {
             return None;
         }
-        self.take_dirty()
-    }
-
-    pub fn take_dirty(&mut self) -> Option<Transition> {
-        self.dirty_since.take()?;
-        self.draft.clone()
+        self.changed_at = None;
+        Some((self.draft.clone()?, std::mem::take(&mut self.restart_preview)))
     }
 
     fn grids(&self) -> (Option<Grid>, Option<Grid>) {
-        let grid = |s: &vimj_core::protocol::SongInfo| s.song.analysis.as_ref().and_then(|a| a.grid);
+        let grid = |s: &SongInfo| s.song.analysis.as_ref().and_then(|a| a.grid);
         self.detail.as_ref().map_or((None, None), |d| (grid(&d.from), grid(&d.to)))
     }
 
@@ -100,18 +155,16 @@ impl Editor {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return Action::Close,
+            KeyCode::Char(':') => return Action::Command,
             KeyCode::Char(' ') => return Action::TogglePreview,
             KeyCode::Char('[') => return Action::Pair(-1),
             KeyCode::Char(']') => return Action::Pair(1),
-            KeyCode::Char('R') | KeyCode::Char('0') => return Action::Reset,
+            KeyCode::Char('R') | KeyCode::Char('0') => self.reset(),
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => self.step_field(1),
             KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => self.step_field(-1),
             KeyCode::Char('g') => self.field = FIELDS[0],
             KeyCode::Char('G') => self.field = FIELDS[FIELDS.len() - 1],
-            KeyCode::Char(c @ '1'..='6') => {
-                let preset = Preset::ALL[c as usize - '1' as usize];
-                self.edit(true, |t| t.set_preset(preset));
-            }
+            KeyCode::Char(c @ '1'..='6') => self.preset(Preset::ALL[c as usize - '1' as usize]),
             KeyCode::Char('s') => self.edit(true, |t| t.sync = !t.sync),
             KeyCode::Char('+') | KeyCode::Char('=') => self.change(Field::Length, 1, false),
             KeyCode::Char('-') => self.change(Field::Length, -1, false),
@@ -134,18 +187,23 @@ impl Editor {
     }
 
     fn edit(&mut self, moves_window: bool, f: impl FnOnce(&mut Transition)) {
-        let Some(t) = self.draft.as_mut() else { return };
+        let (Some(t), Some(d)) = (self.draft.as_mut(), &self.detail) else { return };
         f(t);
         t.auto = false;
-        self.dirty_since = Some(Instant::now());
+        // Kept within both songs, as the daemon keeps what it stores.
+        t.clamp(side(&d.from), side(&d.to));
+        self.changed_at = Some(Instant::now());
         self.restart_preview |= moves_window;
     }
 
+    pub fn preset(&mut self, preset: Preset) {
+        self.edit(true, |t| t.set_preset(preset));
+    }
+
     /// `coarse` moves cue points by a bar instead of a beat.
-    fn change(&mut self, field: Field, by: i32, coarse: bool) {
+    pub fn change(&mut self, field: Field, by: i32, coarse: bool) {
         let (a, b) = self.grids();
-        let beat = |g: Option<Grid>| g.map_or(500.0, |g| g.beat_ms());
-        let step = |g: Option<Grid>| beat(g) * if coarse { f64::from(BEATS_PER_BAR) } else { 1.0 } * f64::from(by);
+        let step = |g: Option<Grid>| beat_ms(g) * if coarse { f64::from(BEATS_PER_BAR) } else { 1.0 } * f64::from(by);
         match field {
             Field::Preset => self.edit(true, |t| {
                 let at = Preset::ALL.iter().position(|p| *p == t.preset).map_or(0, |i| i as i32 + by);
@@ -179,6 +237,40 @@ impl Editor {
             _ => self.edit(true, |t| t.in_ms = (t.in_ms + ms).max(0.0)),
         }
     }
+
+    /// Where A leaves or B enters.
+    pub fn cue(&self, field: Field) -> Option<f64> {
+        let t = self.draft.as_ref()?;
+        match field {
+            Field::Out => Some(t.out_ms),
+            Field::In => Some(t.in_ms),
+            _ => None,
+        }
+    }
+
+    /// Moves a cue point that was at `from_ms` by about `by_ms`, in whole
+    /// beats so the beats stay lined up.
+    pub fn drag(&mut self, field: Field, from_ms: f64, by_ms: f64) {
+        let (a, b) = self.grids();
+        let beat = beat_ms(if field == Field::Out { a } else { b });
+        let to = (from_ms + (by_ms / beat).round() * beat).max(0.0);
+        if self.cue(field).is_none_or(|now| now == to) {
+            return;
+        }
+        match field {
+            Field::Out => self.edit(true, |t| t.out_ms = to),
+            _ => self.edit(true, |t| t.in_ms = to),
+        }
+    }
+}
+
+fn side(s: &SongInfo) -> Side<'_> {
+    Side { duration_ms: s.song.duration_ms as f64, analysis: s.song.analysis.as_ref() }
+}
+
+/// Songs not analysed yet move by half a second, a beat at 120 BPM.
+fn beat_ms(grid: Option<Grid>) -> f64 {
+    grid.map_or(500.0, |g| g.beat_ms())
 }
 
 /// `w`/`b` step a phrase of eight bars.
@@ -189,8 +281,8 @@ fn cycle<T: Copy + PartialEq>(all: &[T], current: T, by: i32) -> T {
     all[(at + by).rem_euclid(all.len() as i32) as usize]
 }
 
-/// Draws the editor over `area`.
-pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<String, Arc<Vec<u8>>>, player: Option<&PlayerState>) {
+/// Draws the editor over `area`, noting what can be clicked in `hits`.
+pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<String, Arc<Vec<u8>>>, player: Option<&PlayerState>, hits: &mut Hits) {
     let (Some(detail), Some(t)) = (&editor.detail, &editor.draft) else {
         frame.render_widget(Paragraph::new(Line::styled("  Loading transition…", dim())), area);
         return;
@@ -201,7 +293,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     let mut lines: Vec<Line> = Vec::new();
 
     // Header: the pair, and how well they match.
-    let song_label = |s: &vimj_core::protocol::SongInfo| {
+    let song_label = |s: &SongInfo| {
         let a = s.song.analysis.as_ref();
         let mut spans = vec![Span::styled(s.song.title.clone(), bold(text()))];
         if !s.song.artist.is_empty() {
@@ -217,7 +309,8 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     };
     lines.push(Line::from(vec![
         Span::styled(format!(" Transition {}/{}", editor.index + 1, editor.count.saturating_sub(1)), bold(accent())),
-        Span::styled(if detail.saved || !t.auto { "   edited" } else { "   automatic" }, dim()),
+        Span::styled(if t.auto { "   automatic" } else { "   edited" }, dim()),
+        Span::styled(if editor.modified() { "   [+] not saved, :w saves" } else { "" }, Style::new().fg(WARN)),
         Span::styled(if editor.previewing { "   ▶ previewing" } else { "" }, accent()),
     ]));
     let mut pair = vec![Span::raw(" A  ")];
@@ -298,12 +391,16 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     let lane_label = |name: &str, f: Field| {
         Line::from(Span::styled(format!(" {name}"), if selected(f) { bold(accent()) } else { subtle() }))
     };
+    let first = lines.len();
     lines.push(lane_label(&format!("A leaves at {} (beat {})", clock_tenths(t.out_ms), beat_label(ga, t.out_ms)), Field::Out));
     lines.extend(lane(waveforms.get(&detail.from.song.id), &a_pos, &a_lit, 3));
     lines.push(ruler(ga, &a_pos, &a_lit));
+    hits.add(mouse::rows(area, first, lines.len() - first), Target::Lane(Field::Out, ms_per_col));
+    let first = lines.len();
     lines.push(lane_label(&format!("B enters at {} (beat {})", clock_tenths(t.in_ms), beat_label(gb, t.in_ms)), Field::In));
     lines.extend(lane(waveforms.get(&detail.to.song.id), &b_pos, &b_lit, 3));
     lines.push(ruler(gb, &b_pos, &b_lit));
+    hits.add(mouse::rows(area, first, lines.len() - first), Target::Lane(Field::In, ms_per_col * timing.rate));
 
     // Automation curves.
     // A deck that isn't playing shows as fully off in every lane.
@@ -329,9 +426,13 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         Line::from(spans)
     };
     lines.push(Line::raw(""));
+    let first = lines.len();
     lines.push(curve(" VOL", Field::Volume, &|d| d.gain));
     lines.push(curve(" LOW", Field::Eq, &|d| d.eq[0]));
     lines.push(curve(" FX", Field::Effect, &|d| d.filter.abs().max(d.echo).max(1.0 - d.speed)));
+    for (k, f) in [Field::Volume, Field::Eq, Field::Effect].into_iter().enumerate() {
+        hits.add(mouse::rows(area, first + k, 1), Target::Field(f));
+    }
     lines.push(Line::from(vec![
         Span::styled("     ", dim()),
         Span::styled("▀ A (outgoing)", Style::new().fg(GREEN)),
@@ -351,24 +452,49 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
             Span::styled(format!("  {note}"), dim()),
         ])
     };
-    let presets: String = Preset::ALL.iter().enumerate().map(|(i, p)| format!("{}{} ", i + 1, p.label())).collect();
-    lines.push(field(Field::Preset, "Preset", t.preset.label().into(), if t.preset == Preset::Custom { "your own curves".into() } else { t.preset.description().into() }));
-    lines.push(field(Field::Length, "Length", bars(t.bars), format!("{:.1} s", timing.duration_ms / 1000.0)));
     let sync_note = match (t.sync, ga.zip(gb)) {
         (true, Some(_)) if (timing.rate - 1.0).abs() > 1e-6 => format!("B plays at {:.1}% to lock the beats, then eases back", timing.rate * 100.0),
         (true, Some(_)) => "same tempo, beats locked".into(),
         (true, None) => "needs both tempos".into(),
         (false, _) => "tempos left alone".into(),
     };
-    lines.push(field(Field::Sync, "Sync", if t.sync { "on".into() } else { "off".into() }, sync_note));
-    lines.push(field(Field::Out, "A out", clock_tenths(t.out_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()));
-    lines.push(field(Field::In, "B in", clock_tenths(t.in_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()));
-    lines.push(field(Field::Volume, "Volume", t.volume.label().into(), String::new()));
-    lines.push(field(Field::Eq, "EQ", t.eq.label().into(), String::new()));
-    lines.push(field(Field::Effect, "Effect", t.effect.label().into(), String::new()));
+    let fields = [
+        (Field::Preset, "Preset", t.preset.label().into(), if t.preset == Preset::Custom { "your own curves".into() } else { t.preset.description().into() }),
+        (Field::Length, "Length", bars(t.bars), format!("{:.1} s", timing.duration_ms / 1000.0)),
+        (Field::Sync, "Sync", if t.sync { "on".into() } else { "off".into() }, sync_note),
+        (Field::Out, "A out", clock_tenths(t.out_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()),
+        (Field::In, "B in", clock_tenths(t.in_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()),
+        (Field::Volume, "Volume", t.volume.label().into(), String::new()),
+        (Field::Eq, "EQ", t.eq.label().into(), String::new()),
+        (Field::Effect, "Effect", t.effect.label().into(), String::new()),
+    ];
+    for (f, name, value, note) in fields {
+        let line = field(f, name, value, note);
+        let row = mouse::rows(area, lines.len(), 1);
+        hits.add(row, Target::Field(f));
+        if selected(f) {
+            // `‹ value ›`: each arrow and the space beside it.
+            let (x, width) = (line.spans[0].width(), line.spans[1].width());
+            hits.add(mouse::columns(row, x, 2), Target::Step(f, -1));
+            hits.add(mouse::columns(row, (x + width).saturating_sub(2), 2), Target::Step(f, 1));
+        }
+        lines.push(line);
+    }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(format!(" {presets}· 0 automatic"), dim()));
-    lines.push(Line::styled(" j/k field · h/l change · space preview loop · [ ] other transitions · s sync · +/- length · esc close", dim()));
+    let row = mouse::rows(area, lines.len(), 1);
+    let mut presets = vec![Span::raw(" ")];
+    for (i, p) in Preset::ALL.iter().enumerate() {
+        let x: usize = presets.iter().map(Span::width).sum();
+        let label = format!("{}{}", i + 1, p.label());
+        hits.add(mouse::columns(row, x, label.len()), Target::Preset(i));
+        presets.push(Span::styled(format!("{label} "), dim()));
+    }
+    presets.push(Span::styled("· ", dim()));
+    let x: usize = presets.iter().map(Span::width).sum();
+    hits.add(mouse::columns(row, x, "0 automatic".len()), Target::Automatic);
+    presets.push(Span::styled("0 automatic", dim()));
+    lines.push(Line::from(presets));
+    lines.push(Line::styled(" j/k field · h/l change · space preview loop · [ ] other transitions · s sync · +/- length · :w save · esc close", dim()));
 
     frame.render_widget(Paragraph::new(lines).style(Style::new().bg(PANEL)), area);
 }
@@ -435,5 +561,98 @@ mod tests {
     fn cycles_wrap_both_ways() {
         assert_eq!(cycle(&Volume::ALL, Volume::Smooth, -1), Volume::CenterCut);
         assert_eq!(cycle(&Volume::ALL, Volume::CenterCut, 1), Volume::Smooth);
+    }
+
+    /// Two four-minute songs at 120 BPM, so a beat is 500 ms, with the
+    /// automatic transition between them.
+    fn pair(from: &str, to: &str) -> TransitionDetail {
+        let song = |id: &str| SongInfo {
+            song: vimj_core::Song {
+                id: id.into(),
+                title: id.into(),
+                artist: String::new(),
+                duration_ms: 240_000,
+                file: format!("{id}.opus"),
+                source: None,
+                added: 0,
+                analysis: Some(vimj_core::Analysis {
+                    version: 1,
+                    grid: Some(Grid { bpm: 120.0, downbeat_ms: 0.0 }),
+                    key: None,
+                    energy: 0.5,
+                    loudness: -9.0,
+                    start_ms: 0.0,
+                    end_ms: 240_000.0,
+                }),
+            },
+            state: vimj_core::protocol::SongState::Ready,
+        };
+        let (from, to) = (song(from), song(to));
+        let compat = vimj_core::compat::compat(from.song.analysis.as_ref(), to.song.analysis.as_ref());
+        let automatic = vimj_core::transition::auto_transition(side(&from), side(&to), &compat);
+        let grid = Some(Grid { bpm: 120.0, downbeat_ms: 0.0 });
+        TransitionDetail { timing: automatic.timing(grid.as_ref(), grid.as_ref()), transition: automatic.clone(), saved: false, automatic, compat, from, to }
+    }
+
+    fn editor() -> Editor {
+        let mut ed = Editor::new(0, 2, "a".into(), "b".into());
+        ed.loaded(pair("a", "b"));
+        ed
+    }
+
+    /// The daemon's answer to `:w`.
+    fn stored(t: &Transition) -> TransitionDetail {
+        TransitionDetail { transition: t.clone(), saved: true, ..pair("a", "b") }
+    }
+
+    #[test]
+    fn edits_stay_unsaved_until_written() {
+        let mut ed = editor();
+        // A late answer about another pair changes nothing.
+        ed.loaded(pair("b", "c"));
+        assert_eq!(ed.detail.as_ref().map(|d| d.to.song.id.as_str()), Some("b"));
+        assert!(!ed.modified());
+
+        ed.change(Field::Volume, 1, false);
+        assert!(ed.modified());
+        let sent = ed.draft.clone().unwrap();
+        ed.change(Field::Eq, 1, false);
+        // Storing what was sent leaves the edit made since unsaved.
+        ed.saved(stored(&sent), &sent);
+        assert!(ed.modified());
+
+        // The draft takes on whatever the daemon stored for it.
+        let sent = ed.draft.clone().unwrap();
+        let mut kept = sent.clone();
+        kept.in_ms += 1.0;
+        ed.saved(stored(&kept), &sent);
+        assert_eq!(ed.draft.as_ref(), Some(&kept));
+        assert!(!ed.modified());
+
+        // Going back to automatic is an edit to write too; :e! undoes it.
+        ed.reset();
+        assert_eq!(ed.draft.as_ref(), Some(&pair("a", "b").automatic));
+        assert!(ed.modified());
+        ed.revert();
+        assert_eq!(ed.draft.as_ref(), Some(&kept));
+        assert!(!ed.modified());
+    }
+
+    #[test]
+    fn dragging_moves_a_cue_by_whole_beats() {
+        let mut ed = editor();
+        let from = ed.cue(Field::In).unwrap();
+        ed.drag(Field::In, from, 200.0);
+        assert!(!ed.modified(), "less than half a beat moves nothing");
+        ed.drag(Field::In, from, 740.0);
+        assert_eq!(ed.cue(Field::In), Some(from + 500.0));
+
+        // A nudge off the beat survives a drag.
+        ed.field = Field::In;
+        ed.key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
+        let nudged = from + 510.0;
+        assert_eq!(ed.cue(Field::In), Some(nudged));
+        ed.drag(Field::In, nudged, 1_100.0);
+        assert_eq!(ed.cue(Field::In), Some(nudged + 1_000.0));
     }
 }

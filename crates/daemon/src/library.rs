@@ -47,12 +47,6 @@ pub struct Playlist {
     pub id: String,
     pub name: String,
     pub songs: Vec<String>,
-    #[serde(default = "yes")]
-    pub mix: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,15 +58,13 @@ struct Store {
     /// Hand-edited transitions, keyed `"{from}>{to}"`.
     #[serde(default)]
     transitions: HashMap<String, Transition>,
-    #[serde(default = "yes")]
-    library_mix: bool,
     #[serde(default)]
     next_playlist: u64,
 }
 
 impl Default for Store {
     fn default() -> Store {
-        Store { songs: Vec::new(), playlists: Vec::new(), transitions: HashMap::new(), library_mix: true, next_playlist: 1 }
+        Store { songs: Vec::new(), playlists: Vec::new(), transitions: HashMap::new(), next_playlist: 1 }
     }
 }
 
@@ -203,17 +195,16 @@ impl Library {
     // Playlists.
 
     pub fn playlists(&self) -> Playlists {
-        let summary = |id: &str, name: &str, ids: &[String], mix: bool| PlaylistSummary {
+        let summary = |id: &str, name: &str, ids: &[String]| PlaylistSummary {
             id: id.to_owned(),
             name: name.to_owned(),
             count: ids.len(),
             duration_ms: ids.iter().filter_map(|id| self.song(id)).map(|s| s.duration_ms).sum(),
-            mix,
         };
         let all: Vec<String> = self.store.songs.iter().map(|s| s.id.clone()).collect();
         Playlists {
-            library: summary(LIBRARY_ID, "Library", &all, self.store.library_mix),
-            playlists: self.store.playlists.iter().map(|p| summary(&p.id, &p.name, &p.songs, p.mix)).collect(),
+            library: summary(LIBRARY_ID, "Library", &all),
+            playlists: self.store.playlists.iter().map(|p| summary(&p.id, &p.name, &p.songs)).collect(),
         }
     }
 
@@ -230,10 +221,6 @@ impl Library {
             return Ok(self.store.songs.iter().map(|s| s.id.clone()).collect());
         }
         Ok(self.playlist(id)?.songs.clone())
-    }
-
-    pub fn mix(&self, id: &str) -> Result<bool> {
-        if id == LIBRARY_ID { Ok(self.store.library_mix) } else { Ok(self.playlist(id)?.mix) }
     }
 
     /// Replaces a playlist's order, recording the old one for undo.
@@ -277,7 +264,7 @@ impl Library {
         self.store.next_playlist += 1;
         let mut seen = HashSet::new();
         let songs = songs.into_iter().filter(|s| self.song(s).is_some() && seen.insert(s.clone())).collect();
-        self.store.playlists.push(Playlist { id: id.clone(), name: name.to_owned(), songs, mix: true });
+        self.store.playlists.push(Playlist { id: id.clone(), name: name.to_owned(), songs });
         self.save();
         Ok(self.playlists().playlists.into_iter().find(|p| p.id == id).expect("just added"))
     }
@@ -287,16 +274,10 @@ impl Library {
             if update.name.is_some() {
                 return Err(Error::Invalid("the library can't be renamed".into()));
             }
-            if let Some(mix) = update.mix {
-                self.store.library_mix = mix;
-            }
         } else {
             let p = self.playlist_mut(id)?;
             if let Some(name) = update.name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) {
                 p.name = name;
-            }
-            if let Some(mix) = update.mix {
-                p.mix = mix;
             }
         }
         self.save();
@@ -323,7 +304,6 @@ impl Library {
         Ok(PlaylistView {
             id: id.to_owned(),
             name,
-            mix: self.mix(id)?,
             songs,
             links,
             can_undo: history.is_some_and(|h| !h.undo.is_empty()),
@@ -425,13 +405,23 @@ impl Library {
 
     /// The transition for a pair, and whether it was edited by hand.
     pub fn transition(&self, from: &str, to: &str) -> Result<(Transition, bool)> {
-        let (a, b) = (self.song(from).ok_or_else(|| not_found("song"))?, self.song(to).ok_or_else(|| not_found("song"))?);
-        if let Some(t) = self.store.transitions.get(&pair_key(from, to)) {
-            let mut t = t.clone();
-            t.clamp(self.side(a), self.side(b));
-            return Ok((t, true));
+        match self.store.transitions.get(&pair_key(from, to)) {
+            Some(t) => Ok((self.fit(from, to, t.clone())?, true)),
+            None => Ok((self.automatic(from, to)?, false)),
         }
-        Ok((auto_transition(self.side(a), self.side(b), &self.compat(from, to)), false))
+    }
+
+    /// The transition vimj picks for a pair by itself.
+    fn automatic(&self, from: &str, to: &str) -> Result<Transition> {
+        let (a, b) = (self.song(from).ok_or_else(|| not_found("song"))?, self.song(to).ok_or_else(|| not_found("song"))?);
+        Ok(auto_transition(self.side(a), self.side(b), &self.compat(from, to)))
+    }
+
+    /// `t` with its cue points and length kept within both songs.
+    pub fn fit(&self, from: &str, to: &str, mut t: Transition) -> Result<Transition> {
+        let (a, b) = (self.song(from).ok_or_else(|| not_found("song"))?, self.song(to).ok_or_else(|| not_found("song"))?);
+        t.clamp(self.side(a), self.side(b));
+        Ok(t)
     }
 
     pub fn link(&self, from: &str, to: &str) -> Link {
@@ -449,16 +439,16 @@ impl Library {
             timing: transition.timing(grid(from).as_ref(), grid(to).as_ref()),
             transition,
             saved,
+            automatic: self.automatic(from, to)?,
         })
     }
 
-    pub fn set_transition(&mut self, from: &str, to: &str, mut t: Transition) -> Result<TransitionDetail> {
-        let (a, b) = (self.song(from).ok_or_else(|| not_found("song"))?, self.song(to).ok_or_else(|| not_found("song"))?);
+    pub fn set_transition(&mut self, from: &str, to: &str, t: Transition) -> Result<TransitionDetail> {
+        let mut t = self.fit(from, to, t)?;
         if from == to {
             return Err(Error::Invalid("a song can't transition into itself".into()));
         }
         t.auto = false;
-        t.clamp(self.side(a), self.side(b));
         self.store.transitions.insert(pair_key(from, to), t);
         self.save();
         self.transition_detail(from, to)
@@ -493,8 +483,8 @@ impl Library {
             .collect())
     }
 
-    /// What the engine needs to play `ids` in order.
-    pub fn entries(&self, ids: &[String], mix: bool, music_dir: &Path) -> Vec<Entry> {
+    /// What the engine needs to play `ids` in order, each song mixing into the next.
+    pub fn entries(&self, ids: &[String], music_dir: &Path) -> Vec<Entry> {
         let songs: Vec<&Song> = ids.iter().filter_map(|i| self.song(i)).collect();
         songs
             .iter()
@@ -504,11 +494,7 @@ impl Library {
                 path: music_dir.join(&s.file),
                 grid: s.analysis.as_ref().and_then(|a| a.grid),
                 gain_db: normalising_gain(s.analysis.as_ref().map(|a| a.loudness)),
-                next: songs
-                    .get(i + 1)
-                    .filter(|_| mix)
-                    .and_then(|next| self.transition(&s.id, &next.id).ok())
-                    .map(|(t, _)| t),
+                next: songs.get(i + 1).and_then(|next| self.transition(&s.id, &next.id).ok()).map(|(t, _)| t),
             })
             .collect()
     }
@@ -625,13 +611,12 @@ mod tests {
     }
 
     #[test]
-    fn entries_carry_transitions_only_when_mixing() {
+    fn entries_carry_a_transition_into_each_next_song() {
         let lib = library();
         let order = ids(&lib, LIBRARY_ID);
-        let mixed = lib.entries(&order, true, Path::new("/music"));
-        assert!(mixed[..3].iter().all(|e| e.next.is_some()) && mixed[3].next.is_none());
-        assert_eq!(mixed[0].path, Path::new("/music/a.opus"));
-        assert!((mixed[0].gain_db - -1.0).abs() < 1e-6);
-        assert!(lib.entries(&order, false, Path::new("/music")).iter().all(|e| e.next.is_none()));
+        let entries = lib.entries(&order, Path::new("/music"));
+        assert!(entries[..3].iter().all(|e| e.next.is_some()) && entries[3].next.is_none());
+        assert_eq!(entries[0].path, Path::new("/music/a.opus"));
+        assert!((entries[0].gain_db - -1.0).abs() < 1e-6);
     }
 }

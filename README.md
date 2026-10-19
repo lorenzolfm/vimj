@@ -16,6 +16,7 @@ song, then let vimj order your songs and blend each one into the next like a DJ.
 - **Analysis** of each song on arrival: tempo, beat grid with downbeats, key, energy, and loudness,
   which evens out levels between songs.
 - **Vim-style keys**: counts, `dd`/`yy`/`p`, visual line mode, `:` commands, `/` search.
+  The mouse works as well.
 
 Only download what you have the right to.
 
@@ -81,15 +82,33 @@ converting it to FLAC or 320 kbps MP3 would only make the file bigger.
 | `t` | the five songs that flow best out of this one; Enter puts it next |
 | `e` | edit the transition into the next song |
 | `s` | smart reorder |
-| `m` | mix on / off (off plays songs back to back) |
 | `Enter` `space` | play from here, pause |
 | `>` `<` | next, previous song |
 | `]` `[` `}` `{` | seek 10 s, 30 s |
 | `+` `-` | volume |
 
-Commands: `:add <link>`, `:new <name>`, `:rename <name>`, `:delete`, `:mix on|off`, `:reorder`,
+Every playlist mixes: each song blends into the next.
+
+Commands: `:add <link>`, `:new <name>`, `:rename <name>`, `:delete`, `:reorder`,
 `:title <text>` and `:artist <text>` for the song under the cursor, `:vol 80`, `:seek 1:30`,
 `:cookies <browser>`, `:rescan`, `:clear` (finished downloads), `:q`, `:q!`, `:help`. `Tab` completes.
+
+### Mouse
+
+| | |
+| --- | --- |
+| click | put the cursor on a song or download; open a playlist from the sidebar |
+| double-click | play from that song |
+| drag | select songs, as `V` does |
+| wheel | scroll the list; over `vol`, change the volume |
+| click INTO NEXT | edit that transition |
+| click the waveform, `▶`, the title | seek there, pause, go to what's playing |
+
+In the transition editor, click a field or the `‹` `›` beside its value, or turn the wheel over it.
+Drag a waveform sideways to move that song's cue point a beat at a time. Click a preset by name, or
+`0 automatic`.
+
+Hold shift to select text in the terminal as usual.
 
 ### The transition editor
 
@@ -104,9 +123,12 @@ Commands: `:add <link>`, `:new <name>`, `:rename <name>`, `:delete`, `:mix on|of
 | `,` `.` | nudge by 10 ms, to line beats up by ear |
 | `1`–`6`, `0` | Fade, Rise, Blend, Wave, Melt, Slam; back to automatic |
 | `s`, `+` `-` | sync on / off, longer / shorter |
-| `space` | loop the transition while you edit |
+| `space` | loop the transition while you edit; it plays your edits before you save them |
 | `[` `]` | previous / next transition in the playlist |
-| `Esc` | close (edits save as you go) |
+| `:w` | save; `[+]` in the header means there are edits to save |
+| `:wq` `:x` | save and close |
+| `Esc` `q` `:q` | close; with unsaved edits it asks you to `:w` or `:q!` first |
+| `:q!`, `:e!` | close throwing the edits away; throw them away and keep editing |
 
 Transitions belong to a pair of songs, so a pair tuned once sounds the same in every playlist.
 

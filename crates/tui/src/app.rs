@@ -1,11 +1,13 @@
 //! TUI state and input. Vim-style: a normal mode with counts, motions and
 //! operators (`5j`, `dd`, `yy`, `p`), a visual line mode (`V`), a command
-//! line (`:`) and search (`/`, `n`, `N`).
+//! line (`:`) and search (`/`, `n`, `N`). The mouse works too.
 
 use crate::client::Client;
-use crate::editor::{self, Action, Editor};
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crate::editor::{self, Action, Editor, Field};
+use crate::mouse::{Clicks, Hits, Target};
+use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use vimj_core::protocol::*;
+use vimj_core::{Preset, Transition};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -17,6 +19,10 @@ const TOAST_FOR: Duration = Duration::from_secs(5);
 const SEEK_MS: f64 = 10_000.0;
 const LONG_SEEK_MS: f64 = 30_000.0;
 const VOLUME_STEP: i16 = 5;
+/// Rows kept between the cursor and the edge of the list as keys move it.
+const SCROLL_MARGIN: usize = 3;
+/// Rows one turn of the wheel scrolls.
+const SCROLL_LINES: isize = 3;
 
 pub enum Msg {
     Event(Event),
@@ -25,6 +31,8 @@ pub enum Msg {
     View(PlaylistView),
     Suggestions { playlist: String, anchor: usize, list: Vec<Suggestion> },
     Transition(TransitionDetail),
+    /// `:w` stored `sent`; `close` shuts the editor now.
+    Saved { detail: TransitionDetail, sent: Transition, close: bool },
     Waveform(String, Option<Vec<u8>>),
     Player(PlayerState),
     Downloads(Vec<Download>),
@@ -151,6 +159,16 @@ pub struct Register {
     pub songs: Vec<String>,
 }
 
+/// What dragging with the button held does.
+#[derive(Clone, Copy, Debug)]
+enum Drag {
+    /// Selects songs from this row.
+    Select { anchor: usize },
+    /// Moves a cue point in the transition editor, from where it was when
+    /// the button went down at `column`.
+    Cue { field: Field, column: u16, from_ms: f64, ms_per_column: f64 },
+}
+
 pub struct App {
     client: Client,
     tx: UnboundedSender<Msg>,
@@ -168,9 +186,16 @@ pub struct App {
     /// Song to put the cursor on when the view next loads.
     cursor_target: Option<String>,
     pub offset: usize,
+    /// Rows kept round the cursor when scrolling: none once the mouse has
+    /// moved it, so a click doesn't scroll the row out from under it.
+    pub margin: usize,
     /// Rows visible in the list, and where it is on screen.
     pub page: usize,
     pub list_area: Rect,
+    /// What the last frame drew where.
+    pub hits: Hits,
+    clicks: Clicks,
+    drag: Option<Drag>,
     pub download_cursor: usize,
     pub visual: Option<usize>,
     pub mode: Mode,
@@ -207,8 +232,12 @@ impl App {
             cursor: 0,
             cursor_target: None,
             offset: 0,
+            margin: SCROLL_MARGIN,
             page: 20,
             list_area: Rect::default(),
+            hits: Hits::default(),
+            clicks: Clicks::default(),
+            drag: None,
             download_cursor: 0,
             visual: None,
             mode: Mode::Normal,
@@ -363,6 +392,17 @@ impl App {
                     self.ensure_waveform(&to);
                 }
             }
+            Msg::Saved { detail, sent, close } => {
+                self.info(format!("Saved the transition into {}: {}", detail.to.song.title, crate::theme::transition_summary(&detail.transition)));
+                if let Some(ed) = &mut self.editor
+                    && ed.is_pair(&detail)
+                {
+                    ed.saved(detail, &sent);
+                    if close {
+                        self.close_editor();
+                    }
+                }
+            }
             Msg::Waveform(id, bytes) => {
                 if let Some(bytes) = bytes {
                     self.waveforms.insert(id, Arc::new(bytes));
@@ -439,8 +479,15 @@ impl App {
         if self.toast.as_ref().is_some_and(|(_, _, at)| at.elapsed() > TOAST_FOR) {
             self.toast = None;
         }
-        if let Some(t) = self.editor.as_mut().and_then(Editor::due) {
-            self.save_transition(t);
+        // A running preview plays the edits as they settle.
+        let due = self.editor.as_mut().and_then(|ed| ed.preview_due().map(|due| (ed.pair(), due)));
+        if let Some(((from, to), (t, restart))) = due {
+            let c = self.client();
+            if restart {
+                self.spawn(async move { c.preview(from, to, editor::LEAD_IN_MS, Some(t)).await }, Msg::Player);
+            } else {
+                self.spawn(async move { c.update_preview(&t).await }, Msg::Player);
+            }
         }
     }
 
@@ -449,21 +496,7 @@ impl App {
     pub fn on_terminal(&mut self, event: TermEvent) {
         match event {
             TermEvent::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
-            TermEvent::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollDown => self.move_cursor(3),
-                MouseEventKind::ScrollUp => self.move_cursor(-3),
-                MouseEventKind::Down(MouseButton::Left) if self.editor.is_none() && self.popup.is_none() => {
-                    let a = self.list_area;
-                    if m.column >= a.x && m.column < a.x + a.width && m.row >= a.y && m.row < a.y + a.height {
-                        let row = self.offset + usize::from(m.row - a.y);
-                        if row < self.songs_len() {
-                            self.focus = Focus::Main;
-                            self.cursor = row;
-                        }
-                    }
-                }
-                _ => {}
-            },
+            TermEvent::Mouse(m) => self.on_mouse(m),
             _ => {}
         }
     }
@@ -488,6 +521,7 @@ impl App {
             self.quit = true;
             return;
         }
+        self.margin = SCROLL_MARGIN;
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Command(mut line) => {
                 match key.code {
@@ -670,7 +704,6 @@ impl App {
             "t" => self.open_suggestions(),
             "e" => self.open_editor(self.cursor),
             "s" => self.playlist_action("smart-reorder"),
-            "m" => self.toggle_mix(),
             "u" => self.playlist_action("undo"),
             "dd" | "x" | "d" => self.delete(n),
             "yy" | "Y" | "y" => self.yank(n),
@@ -699,18 +732,9 @@ impl App {
 
     pub fn move_cursor(&mut self, by: isize) {
         match (self.focus, &self.view) {
-            (Focus::Sidebar, _) => {
-                let len = self.side_items().len() as isize;
-                self.side = (self.side as isize + by).clamp(0, len - 1) as usize;
-            }
-            (Focus::Main, View::Downloads) => {
-                let len = self.downloads.len() as isize;
-                self.download_cursor = (self.download_cursor as isize + by).clamp(0, (len - 1).max(0)) as usize;
-            }
-            (Focus::Main, View::Playlist(_)) => {
-                let len = self.songs_len() as isize;
-                self.cursor = (self.cursor as isize + by).clamp(0, (len - 1).max(0)) as usize;
-            }
+            (Focus::Sidebar, _) => self.side = step(self.side, by, self.side_items().len()),
+            (Focus::Main, View::Downloads) => self.download_cursor = step(self.download_cursor, by, self.downloads.len()),
+            (Focus::Main, View::Playlist(_)) => self.cursor = step(self.cursor, by, self.songs_len()),
         }
     }
 
@@ -827,13 +851,6 @@ impl App {
         }
         let c = self.client();
         self.spawn(async move { c.playlist_action(&id, action).await }, Msg::View);
-    }
-
-    fn toggle_mix(&mut self) {
-        let Some(list) = &self.list else { return };
-        let (c, id, mix) = (self.client(), list.id.clone(), !list.mix);
-        self.info(if mix { "Mix on: songs flow into each other" } else { "Mix off: songs play back to back" });
-        self.spawn(async move { c.update_playlist(&id, PlaylistUpdate { mix: Some(mix), name: None }).await }, Msg::View);
     }
 
     fn delete(&mut self, count: usize) {
@@ -973,12 +990,7 @@ impl App {
                             KeyCode::Char(c @ '1'..='5') => c as usize - '1' as usize,
                             _ => p.cursor,
                         };
-                        if let Some(s) = p.items.as_ref().and_then(|items| items.get(pick)) {
-                            let (c, id, anchor, song) = (self.client(), p.playlist.clone(), p.anchor, s.song.song.id.clone());
-                            self.cursor_target = Some(song.clone());
-                            self.info(format!("{} now plays after {}", s.song.song.title, p.anchor_title));
-                            self.spawn(async move { c.place_after(&id, anchor, song).await }, Msg::View);
-                        } else {
+                        if !self.pick_suggestion(&p, pick) {
                             self.popup = Some(Popup::Suggestions(p));
                         }
                     }
@@ -997,22 +1009,41 @@ impl App {
                         p.cursor = p.cursor.saturating_sub(1);
                         self.popup = Some(Popup::AddTo(p));
                     }
-                    KeyCode::Enter | KeyCode::Char('l') => match targets.get(p.cursor) {
-                        Some((Some(id), name)) => {
-                            let (c, id, songs) = (self.client(), id.clone(), p.songs.clone());
-                            let message = format!("Added {} to {name}", crate::theme::plural(songs.len(), "song"));
-                            self.spawn(async move { c.add_songs(&id, songs, None).await }, move |_| Msg::Info(message));
-                        }
-                        Some((None, _)) => {
-                            self.adding = Some(p.songs);
-                            self.mode = Mode::Command(LineInput::new("new "));
-                            self.info("Name the playlist; the selection goes in it");
-                        }
-                        None => {}
-                    },
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        let at = p.cursor;
+                        self.add_to(p, at);
+                    }
                     _ => self.popup = Some(Popup::AddTo(p)),
                 }
             }
+        }
+    }
+
+    /// Puts suggestion `pick` after the song it was asked for; false if
+    /// there is no such suggestion.
+    fn pick_suggestion(&mut self, p: &SuggestionsPopup, pick: usize) -> bool {
+        let Some(s) = p.items.as_ref().and_then(|items| items.get(pick)) else { return false };
+        let (c, id, anchor, song) = (self.client(), p.playlist.clone(), p.anchor, s.song.song.id.clone());
+        self.cursor_target = Some(song.clone());
+        self.info(format!("{} now plays after {}", s.song.song.title, p.anchor_title));
+        self.spawn(async move { c.place_after(&id, anchor, song).await }, Msg::View);
+        true
+    }
+
+    /// Adds the popup's songs to the playlist at `at` in `add_targets`.
+    fn add_to(&mut self, p: AddToPopup, at: usize) {
+        match self.add_targets().get(at) {
+            Some((Some(id), name)) => {
+                let (c, id, songs) = (self.client(), id.clone(), p.songs);
+                let message = format!("Added {} to {name}", crate::theme::plural(songs.len(), "song"));
+                self.spawn(async move { c.add_songs(&id, songs, None).await }, move |_| Msg::Info(message));
+            }
+            Some((None, _)) => {
+                self.adding = Some(p.songs);
+                self.mode = Mode::Command(LineInput::new("new "));
+                self.info("Name the playlist; the selection goes in it");
+            }
+            None => {}
         }
     }
 
@@ -1024,12 +1055,12 @@ impl App {
             self.info("The last song has no transition after it");
             return;
         }
-        let mut editor = Editor::new(index, list.songs.len());
+        let (from, to) = (list.songs[index].song.id.clone(), list.songs[index + 1].song.id.clone());
+        let mut editor = Editor::new(index, list.songs.len(), from.clone(), to.clone());
         if let Some(e) = &self.editor {
             editor.previewing = e.previewing;
             editor.field = e.field;
         }
-        let (from, to) = (list.songs[index].song.id.clone(), list.songs[index + 1].song.id.clone());
         self.ensure_waveform(&from);
         self.ensure_waveform(&to);
         let previewing = editor.previewing;
@@ -1040,7 +1071,7 @@ impl App {
             match c.transition(&from, &to).await {
                 Ok(d) => {
                     let _ = tx.send(Msg::Transition(d));
-                    if previewing && let Ok(p) = c.preview(from, to, editor::LEAD_IN_MS).await {
+                    if previewing && let Ok(p) = c.preview(from, to, editor::LEAD_IN_MS, None).await {
                         let _ = tx.send(Msg::Player(p));
                     }
                 }
@@ -1051,77 +1082,65 @@ impl App {
         });
     }
 
-    fn save_transition(&mut self, t: vimj_core::Transition) {
-        let Some(ed) = &mut self.editor else { return };
-        let Some((from, to)) = ed.pair() else { return };
-        let restart = ed.previewing && std::mem::take(&mut ed.restart_preview);
-        let c = self.client();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            match c.set_transition(&from, &to, &t).await {
-                Ok(d) => {
-                    let _ = tx.send(Msg::Transition(d));
-                    if restart && let Ok(p) = c.preview(from, to, editor::LEAD_IN_MS).await {
-                        let _ = tx.send(Msg::Player(p));
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Msg::Error(format!("{e:#}")));
-                }
-            }
-        });
+    /// `:w` stores the draft; `close` then shuts the editor.
+    fn write_transition(&mut self, close: bool) {
+        let Some(ed) = &self.editor else { return };
+        let Some(t) = ed.draft.clone() else {
+            self.error("The transition hasn't loaded yet");
+            return;
+        };
+        let ((from, to), c, sent) = (ed.pair(), self.client(), t.clone());
+        self.spawn(
+            async move {
+                // An automatic one is stored by forgetting the edited one.
+                if t.auto { c.reset_transition(&from, &to).await } else { c.set_transition(&from, &to, &t).await }
+            },
+            move |detail| Msg::Saved { detail, sent, close },
+        );
     }
 
-    fn flush_editor(&mut self) {
-        if let Some(t) = self.editor.as_mut().and_then(Editor::take_dirty) {
-            self.save_transition(t);
+    /// Shuts the editor, unless that would lose edits and `force` isn't given.
+    fn quit_editor(&mut self, force: bool) {
+        if !force && self.editor.as_ref().is_some_and(Editor::modified) {
+            self.error("No write since last change (:w saves, :q! throws the edits away)");
+            return;
         }
+        self.close_editor();
+    }
+
+    fn close_editor(&mut self) {
+        if self.editor.as_ref().is_some_and(|e| e.previewing) {
+            self.player_action("stop");
+        }
+        self.editor = None;
+        self.load_view();
+    }
+
+    fn toggle_preview(&mut self) {
+        let Some(ed) = self.editor.as_mut() else { return };
+        if ed.previewing {
+            ed.previewing = false;
+            self.player_action("stop");
+            return;
+        }
+        let ((from, to), Some(t)) = (ed.pair(), ed.start_preview()) else { return };
+        let c = self.client();
+        self.spawn(async move { c.preview(from, to, editor::LEAD_IN_MS, Some(t)).await }, Msg::Player);
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
         let Some(action) = self.editor.as_mut().map(|ed| ed.key(key)) else { return };
         match action {
             Action::None => {}
-            Action::Close => {
-                self.flush_editor();
-                if self.editor.as_ref().is_some_and(|e| e.previewing) {
-                    self.player_action("stop");
-                }
-                self.editor = None;
-                self.load_view();
-            }
-            Action::Reset => {
-                let Some(ed) = self.editor.as_mut() else { return };
-                ed.take_dirty();
-                if let Some((from, to)) = ed.pair() {
-                    let c = self.client();
-                    self.info("Back to the automatic transition");
-                    self.spawn(async move { c.reset_transition(&from, &to).await }, Msg::Transition);
-                }
-            }
-            Action::TogglePreview => {
-                let Some(ed) = self.editor.as_mut() else { return };
-                if ed.previewing {
-                    ed.previewing = false;
-                    self.player_action("stop");
-                } else if let Some((from, to)) = ed.pair() {
-                    ed.previewing = true;
-                    let pending = ed.take_dirty();
-                    let c = self.client();
-                    self.spawn(
-                        async move {
-                            if let Some(t) = pending {
-                                c.set_transition(&from, &to, &t).await?;
-                            }
-                            c.preview(from, to, editor::LEAD_IN_MS).await
-                        },
-                        Msg::Player,
-                    );
-                }
-            }
+            Action::Close => self.quit_editor(false),
+            Action::Command => self.mode = Mode::Command(LineInput::default()),
+            Action::TogglePreview => self.toggle_preview(),
             Action::Pair(by) => {
-                self.flush_editor();
                 let Some(ed) = self.editor.as_ref() else { return };
+                if ed.modified() {
+                    self.error("No write since last change (:w saves, :e! throws the edits away)");
+                    return;
+                }
                 let target = ed.index as isize + by;
                 if target >= 0 && (target as usize) + 1 < ed.count {
                     self.cursor = target as usize;
@@ -1129,6 +1148,199 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Commands that act on the open transition editor. False for the rest.
+    fn editor_command(&mut self, name: &str) -> bool {
+        match name {
+            "w" | "w!" | "write" => self.write_transition(false),
+            "wq" | "wq!" | "x" | "x!" | "xit" => self.write_transition(true),
+            "q" | "quit" => self.quit_editor(false),
+            "q!" | "quit!" => self.quit_editor(true),
+            "e!" | "edit!" => {
+                if let Some(ed) = &mut self.editor {
+                    ed.revert();
+                }
+            }
+            "qa" if self.editor.as_ref().is_some_and(Editor::modified) => self.error("No write since last change (:w saves, :qa! quits anyway)"),
+            _ => return false,
+        }
+        true
+    }
+
+    // Mouse.
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        // The command line and questions want the keyboard.
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        let hit = self.hits.at(m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pending.clear();
+                self.drag = None;
+                if let Some((area, target)) = hit {
+                    let double = self.clicks.click(target);
+                    self.click(target, area, m.column, double);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(m.column, m.row),
+            MouseEventKind::Up(MouseButton::Left) => self.drag = None,
+            MouseEventKind::ScrollDown => {
+                if let Some((_, target)) = hit {
+                    self.scroll(target, 1);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some((_, target)) = hit {
+                    self.scroll(target, -1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A left click on `target`, drawn over `area`.
+    fn click(&mut self, target: Target, area: Rect, column: u16, double: bool) {
+        match target {
+            Target::Backdrop => self.popup = None,
+            Target::Popup | Target::Volume => {}
+            Target::Pane(focus) => self.focus = focus,
+            Target::Side(i) => {
+                self.side = i;
+                self.focus = Focus::Sidebar;
+                self.enter();
+            }
+            Target::Song(i) => {
+                self.focus = Focus::Main;
+                self.margin = 0;
+                self.visual = None;
+                self.cursor = i;
+                self.drag = Some(Drag::Select { anchor: i });
+                if double {
+                    self.enter();
+                }
+            }
+            Target::Link(i) => {
+                self.focus = Focus::Main;
+                self.margin = 0;
+                self.visual = None;
+                self.cursor = i;
+                self.open_editor(i);
+            }
+            Target::Download(i) => {
+                self.focus = Focus::Main;
+                self.download_cursor = i;
+                if double {
+                    self.enter();
+                }
+            }
+            Target::Seek => {
+                let Some(song) = self.player.as_ref().and_then(|p| p.song.as_ref()) else { return };
+                let to = song.duration_ms as f64 * f64::from(column - area.x) / f64::from(area.width);
+                let c = self.client();
+                self.spawn(async move { c.seek(to).await }, Msg::Player);
+            }
+            Target::Toggle => self.player_action("toggle"),
+            // Leaving the editor this way would leave it on another list.
+            Target::Playing if self.editor.is_none() => self.go_to_playing(),
+            Target::Playing => {}
+            Target::Suggestion(i) => {
+                let Some(Popup::Suggestions(mut p)) = self.popup.take() else { return };
+                p.cursor = i;
+                if !(double && self.pick_suggestion(&p, i)) {
+                    self.popup = Some(Popup::Suggestions(p));
+                }
+            }
+            Target::AddTo(i) => {
+                let Some(Popup::AddTo(p)) = self.popup.take() else { return };
+                self.add_to(p, i);
+            }
+            Target::Field(_) | Target::Step(..) | Target::Lane(..) | Target::Preset(_) | Target::Automatic => {
+                let Some(ed) = self.editor.as_mut() else { return };
+                match target {
+                    Target::Field(f) => ed.field = f,
+                    Target::Step(f, by) => {
+                        ed.field = f;
+                        ed.change(f, by, false);
+                    }
+                    Target::Lane(f, ms_per_column) => {
+                        ed.field = f;
+                        if let Some(from_ms) = ed.cue(f) {
+                            self.drag = Some(Drag::Cue { field: f, column, from_ms, ms_per_column });
+                        }
+                    }
+                    Target::Preset(i) => ed.preset(Preset::ALL[i]),
+                    Target::Automatic => ed.reset(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn drag_to(&mut self, column: u16, row: u16) {
+        match self.drag {
+            Some(Drag::Select { anchor }) => {
+                // Above or below the list, it scrolls a row at a time.
+                let a = self.list_area;
+                let to = if row < a.y {
+                    self.cursor.saturating_sub(1)
+                } else if row >= a.bottom() {
+                    self.cursor + 1
+                } else {
+                    self.offset + usize::from(row - a.y)
+                };
+                let to = to.min(self.songs_len().saturating_sub(1));
+                if to != anchor {
+                    self.visual = Some(anchor);
+                }
+                self.cursor = to;
+            }
+            Some(Drag::Cue { field, column: from, from_ms, ms_per_column }) => {
+                if let Some(ed) = self.editor.as_mut() {
+                    // The waveform follows the pointer, so dragging right
+                    // brings an earlier part of the song into the window.
+                    ed.drag(field, from_ms, -(f64::from(column) - f64::from(from)) * ms_per_column);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The wheel over `target`; `down` is 1 or -1.
+    fn scroll(&mut self, target: Target, down: isize) {
+        match target {
+            Target::Song(_) | Target::Link(_) | Target::Pane(Focus::Main) if matches!(self.view, View::Playlist(_)) => {
+                self.scroll_list(down * SCROLL_LINES);
+            }
+            Target::Suggestion(_) | Target::AddTo(_) | Target::Popup => {
+                let targets = self.add_targets().len();
+                match &mut self.popup {
+                    Some(Popup::Suggestions(p)) => p.cursor = step(p.cursor, down, p.items.as_ref().map_or(0, Vec::len)),
+                    Some(Popup::AddTo(p)) => p.cursor = step(p.cursor, down, targets),
+                    _ => {}
+                }
+            }
+            Target::Volume => self.change_volume(-down as i16 * VOLUME_STEP),
+            // Up raises a value, as on a knob.
+            Target::Field(f) | Target::Step(f, _) | Target::Lane(f, _) => {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.field = f;
+                    ed.change(f, -down as i32, false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scrolls the song list, taking the cursor along when it would go off screen.
+    fn scroll_list(&mut self, by: isize) {
+        let len = self.songs_len();
+        self.offset = step(self.offset, by, len.saturating_sub(self.page) + 1);
+        let last = (self.offset + self.page).min(len).saturating_sub(1);
+        self.cursor = self.cursor.clamp(self.offset, last.max(self.offset));
+        self.margin = 0;
     }
 
     // Commands.
@@ -1140,10 +1352,14 @@ impl App {
             self.jump(n.saturating_sub(1));
             return;
         }
+        if self.editor.is_some() && self.editor_command(name) {
+            return;
+        }
         let c = self.client();
         match name {
             "" => {}
-            "q" | "quit" => self.quit = true,
+            "q" | "quit" | "wq" | "x" => self.quit = true,
+            "w" | "write" => self.info("Playlists save as you go; :w saves a transition you are editing (e)"),
             "q!" | "qa" | "qa!" => {
                 self.stop_daemon = true;
                 self.quit = true;
@@ -1169,7 +1385,7 @@ impl App {
                     self.error("Open a playlist to rename it");
                     return;
                 };
-                let update = PlaylistUpdate { name: Some(arg), mix: None };
+                let update = PlaylistUpdate { name: Some(arg) };
                 self.spawn(async move { c.update_playlist(&id, update).await }, Msg::View);
             }
             "delete" => {
@@ -1180,16 +1396,6 @@ impl App {
                 } else {
                     self.error("Open a playlist to delete it");
                 }
-            }
-            "mix" => {
-                let Some(list) = &self.list else { return };
-                let mix = match arg.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    _ => !list.mix,
-                };
-                let id = list.id.clone();
-                self.spawn(async move { c.update_playlist(&id, PlaylistUpdate { mix: Some(mix), name: None }).await }, Msg::View);
             }
             "reorder" | "smart" => self.playlist_action("smart-reorder"),
             "undo" => self.playlist_action("undo"),
@@ -1235,10 +1441,15 @@ impl App {
 }
 
 /// Commands `Tab` completes.
-pub const COMMANDS: [&str; 22] = [
-    "add", "artist", "clear", "cookies", "delete", "download", "help", "mix", "new", "q", "q!", "quit", "redo", "rename",
-    "reorder", "rescan", "seek", "smart", "stop", "title", "undo", "vol",
+pub const COMMANDS: [&str; 24] = [
+    "add", "artist", "clear", "cookies", "delete", "download", "help", "new", "q", "q!", "quit", "redo", "rename",
+    "reorder", "rescan", "seek", "smart", "stop", "title", "undo", "vol", "w", "wq", "x",
 ];
+
+/// `at` moved `by` within `0..len`.
+fn step(at: usize, by: isize, len: usize) -> usize {
+    (at as isize + by).clamp(0, (len as isize - 1).max(0)) as usize
+}
 
 fn complete(line: &str) -> String {
     if line.contains(' ') {
