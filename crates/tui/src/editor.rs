@@ -1,15 +1,18 @@
 //! The transition editor: both songs' waveforms lined up on one timeline,
-//! the volume, EQ and effect curves under them, and a field list edited the
-//! vim way: `j`/`k` pick a field, `h`/`l` change it. Edits stay in a draft
-//! until `:w` stores them, as in a vim buffer.
+//! the volume, EQ, filter and effect curves under them, and a field list
+//! edited the vim way: `j`/`k` pick a field, `h`/`l` change it. `c` draws a
+//! field's curves by hand, point by point, as Spotify's Customise does.
+//! Edits stay in a draft until `:w` stores them, as in a vim buffer, and `u`
+//! and `C-r` step back and forth through them.
 
 use crate::mouse::{self, Hits, Target};
 use crate::theme::{self, *};
 use crate::wave;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use vimj_core::curve::{self, Point};
 use vimj_core::model::{BEATS_PER_BAR, Grid};
 use vimj_core::protocol::{PlayerState, SongInfo, TransitionDetail};
-use vimj_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Preset, Side, Transition, Volume};
+use vimj_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Filter, FilterKind, Lane, Looping, Preset, Side, Track, Transition, Volume};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -25,6 +28,17 @@ const PREVIEW_AFTER: Duration = Duration::from_millis(300);
 const NUDGE_MS: f64 = 10.0;
 /// The outgoing song plays this long before the window when previewing.
 pub const LEAD_IN_MS: f64 = 4_000.0;
+/// Edits `u` can take back.
+const HISTORY: usize = 100;
+/// `j`/`k` change a curve point's value by this much, `J`/`K` by the jump.
+const VALUE_STEP: f32 = 0.05;
+const VALUE_JUMP: f32 = 0.25;
+/// `,`/`.` move a curve point by this much of the window.
+const POINT_NUDGE: f32 = 0.01;
+/// `<`/`>` bend a segment by this much.
+const BEND_STEP: f32 = 0.1;
+/// Rows of each song's curve while drawing one.
+const PLOT_ROWS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -35,10 +49,43 @@ pub enum Field {
     In,
     Volume,
     Eq,
+    Filter,
     Effect,
+    Looping,
 }
 
-const FIELDS: [Field; 8] = [Field::Preset, Field::Length, Field::Sync, Field::Out, Field::In, Field::Volume, Field::Eq, Field::Effect];
+const FIELDS: [Field; 10] =
+    [Field::Preset, Field::Length, Field::Sync, Field::Out, Field::In, Field::Volume, Field::Eq, Field::Filter, Field::Effect, Field::Looping];
+
+impl Field {
+    /// The curves a field picks the style of.
+    pub fn lane(self) -> Option<Lane> {
+        match self {
+            Field::Volume => Some(Lane::Volume),
+            Field::Eq => Some(Lane::Eq),
+            Field::Filter => Some(Lane::Filter),
+            Field::Effect => Some(Lane::Effect),
+            _ => None,
+        }
+    }
+
+    fn of(lane: Lane) -> Field {
+        match lane {
+            Lane::Volume => Field::Volume,
+            Lane::Eq => Field::Eq,
+            Lane::Filter => Field::Filter,
+            Lane::Effect => Field::Effect,
+        }
+    }
+}
+
+/// A curve being drawn by hand: one lane of one song, and the point picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Drawing {
+    pub lane: Lane,
+    pub track: Track,
+    pub point: usize,
+}
 
 pub struct Editor {
     /// The pair is `songs[index]` → `songs[index + 1]`.
@@ -51,6 +98,13 @@ pub struct Editor {
     /// The transition being edited, which `:w` stores.
     pub draft: Option<Transition>,
     pub field: Field,
+    /// Drawing a curve by hand, instead of picking fields.
+    pub drawing: Option<Drawing>,
+    /// Drafts before each edit, and those `u` stepped back over.
+    undo: Vec<Transition>,
+    redo: Vec<Transition>,
+    /// A mouse drag of a curve point already made its undo step.
+    dragged: bool,
     /// When the draft last changed, until a running preview hears of it.
     changed_at: Option<Instant>,
     /// The last edit moved the window, so a running preview should start over.
@@ -65,11 +119,27 @@ pub enum Action {
     TogglePreview,
     /// Move to the pair this many places away.
     Pair(isize),
+    Error(String),
 }
 
 impl Editor {
     pub fn new(index: usize, count: usize, from: String, to: String) -> Editor {
-        Editor { index, count, from, to, detail: None, draft: None, field: Field::Preset, changed_at: None, restart_preview: false, previewing: false }
+        Editor {
+            index,
+            count,
+            from,
+            to,
+            detail: None,
+            draft: None,
+            field: Field::Preset,
+            drawing: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            dragged: false,
+            changed_at: None,
+            restart_preview: false,
+            previewing: false,
+        }
     }
 
     pub fn pair(&self) -> (String, String) {
@@ -122,9 +192,43 @@ impl Editor {
     }
 
     fn replace(&mut self, t: Transition) {
-        self.draft = Some(t);
+        if self.draft.as_ref() == Some(&t) {
+            return;
+        }
+        if let Some(before) = self.draft.replace(t) {
+            self.remember(before);
+        }
+        self.changed(true);
+    }
+
+    fn remember(&mut self, before: Transition) {
+        self.undo.push(before);
+        if self.undo.len() > HISTORY {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn changed(&mut self, moves_window: bool) {
         self.changed_at = Some(Instant::now());
-        self.restart_preview = true;
+        self.restart_preview |= moves_window;
+        self.fit_drawing();
+    }
+
+    /// Takes back the last edit.
+    pub fn undo(&mut self) {
+        if let Some(before) = self.undo.pop() {
+            self.redo.extend(self.draft.replace(before));
+            self.changed(true);
+        }
+    }
+
+    /// Makes an edit `u` took back again.
+    pub fn redo(&mut self) {
+        if let Some(after) = self.redo.pop() {
+            self.undo.extend(self.draft.replace(after));
+            self.changed(true);
+        }
     }
 
     /// Starts previewing; returns what to play.
@@ -152,19 +256,31 @@ impl Editor {
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char(':') => return Action::Command,
+            KeyCode::Char(' ') => return Action::TogglePreview,
+            KeyCode::Char('u') => self.undo(),
+            KeyCode::Char('r') if ctrl => self.redo(),
+            _ if self.drawing.is_some() => self.drawing_key(key),
+            _ => return self.field_key(key),
+        }
+        Action::None
+    }
+
+    fn field_key(&mut self, key: KeyEvent) -> Action {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return Action::Close,
-            KeyCode::Char(':') => return Action::Command,
-            KeyCode::Char(' ') => return Action::TogglePreview,
             KeyCode::Char('[') => return Action::Pair(-1),
             KeyCode::Char(']') => return Action::Pair(1),
+            KeyCode::Char('c') => return self.customize(),
             KeyCode::Char('R') | KeyCode::Char('0') => self.reset(),
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => self.step_field(1),
             KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => self.step_field(-1),
             KeyCode::Char('g') => self.field = FIELDS[0],
             KeyCode::Char('G') => self.field = FIELDS[FIELDS.len() - 1],
-            KeyCode::Char(c @ '1'..='6') => self.preset(Preset::ALL[c as usize - '1' as usize]),
+            KeyCode::Char(c @ '1'..='9') => self.preset(Preset::ALL[c as usize - '1' as usize]),
             KeyCode::Char('s') => self.edit(true, |t| t.sync = !t.sync),
             KeyCode::Char('+') | KeyCode::Char('=') => self.change(Field::Length, 1, false),
             KeyCode::Char('-') => self.change(Field::Length, -1, false),
@@ -181,19 +297,60 @@ impl Editor {
         Action::None
     }
 
+    fn drawing_key(&mut self, key: KeyEvent) {
+        let beats = BEATS_PER_BAR as f32;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Enter => self.drawing = None,
+            KeyCode::Tab | KeyCode::BackTab => self.switch_track(),
+            KeyCode::Char('w') | KeyCode::Char('e') => self.step_point(1),
+            KeyCode::Char('b') => self.step_point(-1),
+            KeyCode::Char('0') | KeyCode::Char('^') | KeyCode::Home => self.pick_point(0),
+            KeyCode::Char('$') | KeyCode::End => self.pick_point(usize::MAX),
+            KeyCode::Char('h') | KeyCode::Left => self.move_by_beats(-1.0),
+            KeyCode::Char('l') | KeyCode::Right => self.move_by_beats(1.0),
+            KeyCode::Char('H') => self.move_by_beats(-beats),
+            KeyCode::Char('L') => self.move_by_beats(beats),
+            KeyCode::Char(',') => self.move_point(-POINT_NUDGE, 0.0),
+            KeyCode::Char('.') => self.move_point(POINT_NUDGE, 0.0),
+            KeyCode::Char('k') | KeyCode::Up => self.move_point(0.0, VALUE_STEP),
+            KeyCode::Char('j') | KeyCode::Down => self.move_point(0.0, -VALUE_STEP),
+            KeyCode::Char('K') => self.move_point(0.0, VALUE_JUMP),
+            KeyCode::Char('J') => self.move_point(0.0, -VALUE_JUMP),
+            KeyCode::Char('o') | KeyCode::Char('a') => self.add_point(),
+            KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => self.delete_point(),
+            KeyCode::Char('s') => self.edit_curve(true, |points, i| curve::toggle_linear(points, *i)),
+            KeyCode::Char('<') => self.edit_curve(true, |points, i| curve::bend(points, *i, -BEND_STEP)),
+            KeyCode::Char('>') => self.edit_curve(true, |points, i| curve::bend(points, *i, BEND_STEP)),
+            KeyCode::Char('R') => self.reset_curve(),
+            _ => {}
+        }
+    }
+
     fn step_field(&mut self, by: isize) {
         let at = FIELDS.iter().position(|f| *f == self.field).unwrap_or(0) as isize;
         self.field = FIELDS[(at + by).rem_euclid(FIELDS.len() as isize) as usize];
     }
 
     fn edit(&mut self, moves_window: bool, f: impl FnOnce(&mut Transition)) {
-        let (Some(t), Some(d)) = (self.draft.as_mut(), &self.detail) else { return };
-        f(t);
-        t.auto = false;
+        self.edit_with(moves_window, true, f);
+    }
+
+    /// Applies an edit to the draft; `record` gives it its own undo step.
+    fn edit_with(&mut self, moves_window: bool, record: bool, f: impl FnOnce(&mut Transition)) {
+        let (Some(t), Some(d)) = (&self.draft, &self.detail) else { return };
+        let mut after = t.clone();
+        f(&mut after);
+        after.auto = false;
         // Kept within both songs, as the daemon keeps what it stores.
-        t.clamp(side(&d.from), side(&d.to));
-        self.changed_at = Some(Instant::now());
-        self.restart_preview |= moves_window;
+        after.clamp(side(&d.from), side(&d.to));
+        if (Transition { auto: t.auto, ..after.clone() }) == *t {
+            return;
+        }
+        let before = self.draft.replace(after).expect("checked above");
+        if record {
+            self.remember(before);
+        }
+        self.changed(moves_window);
     }
 
     pub fn preset(&mut self, preset: Preset) {
@@ -216,18 +373,11 @@ impl Editor {
             Field::Sync => self.edit(true, |t| t.sync = !t.sync),
             Field::Out => self.edit(true, |t| t.out_ms = (t.out_ms + step(a)).max(0.0)),
             Field::In => self.edit(true, |t| t.in_ms = (t.in_ms + step(b)).max(0.0)),
-            Field::Volume => self.edit(false, |t| {
-                t.volume = cycle(&Volume::ALL, t.volume, by);
-                t.customize();
-            }),
-            Field::Eq => self.edit(false, |t| {
-                t.eq = cycle(&Eq::ALL, t.eq, by);
-                t.customize();
-            }),
-            Field::Effect => self.edit(false, |t| {
-                t.effect = cycle(&Effect::ALL, t.effect, by);
-                t.customize();
-            }),
+            Field::Volume => self.edit(false, |t| t.set_volume(cycle(&Volume::ALL, t.volume, by))),
+            Field::Eq => self.edit(false, |t| t.set_eq(cycle(&Eq::ALL, t.eq, by))),
+            Field::Filter => self.edit(false, |t| t.set_filter(cycle(&Filter::ALL, t.filter, by))),
+            Field::Effect => self.edit(false, |t| t.set_effect(cycle(&Effect::ALL, t.effect, by))),
+            Field::Looping => self.edit(false, |t| t.set_looping(cycle(&Looping::ALL, t.looping, by))),
         }
     }
 
@@ -262,6 +412,163 @@ impl Editor {
             _ => self.edit(true, |t| t.in_ms = to),
         }
     }
+
+    // Drawing curves.
+
+    /// Starts drawing the chosen field's curves by hand.
+    pub fn customize(&mut self) -> Action {
+        match self.field.lane() {
+            Some(lane) => self.draw_lane(lane),
+            None => Action::Error("Volume, EQ, Filter and Effects have curves to draw; pick one of them".into()),
+        }
+    }
+
+    pub fn draw_lane(&mut self, lane: Lane) -> Action {
+        let Some(t) = &self.draft else { return Action::None };
+        let Some(track) = [Track::Out, Track::In].into_iter().find(|&k| t.curve(lane, k).is_some()) else {
+            return Action::Error(format!("{} is None, so there is no curve to draw: pick a style first", lane.label()));
+        };
+        self.field = Field::of(lane);
+        self.drawing = Some(Drawing { lane, track, point: 0 });
+        Action::None
+    }
+
+    /// The curve being drawn.
+    pub fn points(&self) -> Option<&[Point]> {
+        let d = self.drawing?;
+        self.draft.as_ref()?.curve(d.lane, d.track)
+    }
+
+    /// Keeps the drawing on a curve that exists, after the draft changed under it.
+    fn fit_drawing(&mut self) {
+        let (Some(mut d), Some(t)) = (self.drawing, &self.draft) else { return };
+        if t.curve(d.lane, d.track).is_none() {
+            d.track = if d.track == Track::Out { Track::In } else { Track::Out };
+        }
+        self.drawing = t.curve(d.lane, d.track).map(|points| Drawing { point: d.point.min(points.len() - 1), ..d });
+    }
+
+    fn switch_track(&mut self) {
+        let (Some(d), Some(t)) = (self.drawing, &self.draft) else { return };
+        let other = if d.track == Track::Out { Track::In } else { Track::Out };
+        if t.curve(d.lane, other).is_some() {
+            self.drawing = Some(Drawing { track: other, ..d });
+            self.fit_drawing();
+        }
+    }
+
+    fn step_point(&mut self, by: isize) {
+        let Some(d) = self.drawing else { return };
+        self.pick_point(d.point.saturating_add_signed(by));
+    }
+
+    fn pick_point(&mut self, i: usize) {
+        let Some(len) = self.points().map(<[Point]>::len) else { return };
+        if let Some(d) = &mut self.drawing {
+            d.point = i.min(len - 1);
+        }
+    }
+
+    /// Redraws the curve being drawn; `record` gives the edit its own undo step.
+    fn edit_curve(&mut self, record: bool, f: impl FnOnce(&mut Vec<Point>, &mut usize)) {
+        let Some(Drawing { lane, track, mut point }) = self.drawing else { return };
+        self.edit_with(false, record, |t| {
+            if let Some(points) = t.curve_mut(lane, track) {
+                f(points, &mut point);
+                point = point.min(points.len() - 1);
+            }
+            t.customize();
+        });
+        if let Some(d) = &mut self.drawing {
+            d.point = point;
+        }
+    }
+
+    fn window_beats(&self) -> f32 {
+        self.draft.as_ref().map_or(16.0, |t| (t.bars * BEATS_PER_BAR) as f32)
+    }
+
+    /// Moves the point by whole beats, landing on the beat.
+    fn move_by_beats(&mut self, beats: f32) {
+        let per = self.window_beats();
+        self.edit_curve(true, |points, i| {
+            let p = points[*i];
+            curve::move_point(points, *i, ((p.x * per).round() + beats) / per, p.y);
+        });
+    }
+
+    fn move_point(&mut self, dx: f32, dy: f32) {
+        self.edit_curve(true, |points, i| {
+            let p = points[*i];
+            curve::move_point(points, *i, p.x + dx, p.y + dy);
+        });
+    }
+
+    /// Adds a point halfway to the next one, or to the previous from the last.
+    fn add_point(&mut self) {
+        self.edit_curve(true, |points, i| {
+            let (a, b) = if *i + 1 < points.len() { (*i, *i + 1) } else { (*i - 1, *i) };
+            if let Some(at) = curve::insert(points, (points[a].x + points[b].x) / 2.0) {
+                *i = at;
+            }
+        });
+    }
+
+    fn delete_point(&mut self) {
+        self.edit_curve(true, |points, i| {
+            curve::remove(points, *i);
+        });
+    }
+
+    /// Goes back to the style's curve for this song.
+    fn reset_curve(&mut self) {
+        let Some(d) = self.drawing else { return };
+        self.edit(false, |t| {
+            t.reset_curve(d.lane, d.track);
+            t.customize();
+        });
+    }
+
+    /// A click on a song's curve at `x` through the window: picks the
+    /// nearest point within `reach` of it, or on a double click adds one.
+    /// Says whether a point is picked to drag.
+    pub fn click_curve(&mut self, track: Track, x: f32, reach: f32, double: bool) -> bool {
+        let Some(d) = self.drawing else { return false };
+        if d.track != track {
+            if self.draft.as_ref().and_then(|t| t.curve(d.lane, track)).is_none() {
+                return false;
+            }
+            self.drawing = Some(Drawing { track, point: 0, ..d });
+        }
+        self.dragged = false;
+        if double {
+            self.edit_curve(true, |points, i| {
+                if let Some(at) = curve::insert(points, x) {
+                    *i = at;
+                }
+            });
+            return true;
+        }
+        let Some(points) = self.points() else { return false };
+        let nearest = (0..points.len()).min_by(|&a, &b| (points[a].x - x).abs().total_cmp(&(points[b].x - x).abs()));
+        match nearest.filter(|&i| (points[i].x - x).abs() <= reach) {
+            Some(i) => {
+                self.pick_point(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drags the picked point to (`x`, `y`), onto a beat or the middle when
+    /// within `snap` of one. A whole drag is one undo step.
+    pub fn drag_point(&mut self, x: f32, y: f32, snap: f32) {
+        let per = self.window_beats();
+        let on_beat = (x * per).round() / per;
+        let x = [on_beat, 0.5].into_iter().find(|s| (s - x).abs() <= snap).unwrap_or(x);
+        let record = !std::mem::replace(&mut self.dragged, true);
+        self.edit_curve(record, |points, i| curve::move_point(points, *i, x, y));
+    }
 }
 
 fn side(s: &SongInfo) -> Side<'_> {
@@ -281,6 +588,43 @@ fn cycle<T: Copy + PartialEq>(all: &[T], current: T, by: i32) -> T {
     all[(at + by).rem_euclid(all.len() as i32) as usize]
 }
 
+/// What a lane's value means for one song, as in "80% volume".
+fn measure(t: &Transition, lane: Lane, track: Track) -> &'static str {
+    match lane {
+        Lane::Volume => "volume",
+        Lane::Eq => "bass",
+        Lane::Filter => match t.filter.kind(track) {
+            Some(FilterKind::LowPass) => "low-pass closed",
+            Some(FilterKind::HighPass) => "high-pass closed",
+            Some(FilterKind::Noise) | None => "noise",
+        },
+        Lane::Effect => match t.effect.kind() {
+            Some(vimj_core::transition::EffectKind::Reverb) => "reverb send",
+            Some(_) | None => "echo send",
+        },
+    }
+}
+
+fn track_name(track: Track) -> &'static str {
+    match track {
+        Track::Out => "A",
+        Track::In => "B",
+    }
+}
+
+/// Which songs have a lane drawn by hand: "A", "B", "A and B" or "".
+fn custom_on(t: &Transition, lane: Lane) -> &'static str {
+    match (t.is_custom(lane, Track::Out), t.is_custom(lane, Track::In)) {
+        (true, true) => "A and B",
+        (true, false) => "A",
+        (false, true) => "B",
+        (false, false) => "",
+    }
+}
+
+/// Braille dots by column (left, right) and row from the top.
+const DOTS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+
 /// Draws the editor over `area`, noting what can be clicked in `hits`.
 pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<String, Arc<Vec<u8>>>, player: Option<&PlayerState>, hits: &mut Hits) {
     let (Some(detail), Some(t)) = (&editor.detail, &editor.draft) else {
@@ -290,6 +634,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     let width = area.width.saturating_sub(4) as usize;
     let (ga, gb) = (detail.from.song.analysis.as_ref().and_then(|a| a.grid), detail.to.song.analysis.as_ref().and_then(|a| a.grid));
     let timing = t.timing(ga.as_ref(), gb.as_ref());
+    let looping = t.loop_map(ga.as_ref());
     let mut lines: Vec<Line> = Vec::new();
 
     // Header: the pair, and how well they match.
@@ -336,7 +681,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         let mut rows: Vec<Vec<Span>> = vec![Vec::new(); height];
         for c in 0..width {
             let (from, to) = (position(col_time(c)), position(col_time(c + 1)));
-            let column = wave.and_then(|w| wave::column(w, from, to));
+            let column = wave.and_then(|w| wave::column(w, from.min(to), from.max(to)));
             let on = lit(col_time(c));
             let level = column.map_or(0.0, |col| col.peak);
             let color = column.map_or(FAINT, |col| wave::color(col, on));
@@ -356,11 +701,12 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
             Line::from(r)
         }).collect()
     };
-    let ruler = |grid: Option<Grid>, position: &dyn Fn(f64) -> f64, lit: &dyn Fn(f64) -> bool| -> Line<'static> {
+    let ruler = |grid: Option<Grid>, position: &dyn Fn(f64) -> f64, lit: &dyn Fn(f64) -> bool, seam: &dyn Fn(f64, f64) -> bool| -> Line<'static> {
         let mut spans = vec![Span::raw("  ")];
         for c in 0..width {
             let (from, to) = (position(col_time(c)), position(col_time(c + 1)));
             let glyph = match grid {
+                _ if seam(col_time(c), col_time(c + 1)) => '↺',
                 Some(_) if to <= 0.0 => ' ',
                 Some(g) => {
                     let first = g.beat_at(from).ceil();
@@ -374,6 +720,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
             };
             let on = lit(col_time(c));
             let color = match glyph {
+                '↺' => WARN,
                 '┃' if on => GREEN,
                 '┃' => SUBTLE,
                 _ => DIM,
@@ -383,10 +730,17 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         Line::from(spans)
     };
 
-    let a_pos = |ms: f64| t.out_ms + ms;
+    // A plays through its loop, if it has one; the repeats show dimmer.
+    let a_pos = |ms: f64| {
+        let at = t.out_ms + ms;
+        at + looping.as_ref().filter(|_| ms < timing.duration_ms).map_or(0.0, |m| m.offset(at))
+    };
     let b_pos = |ms: f64| t.in_ms + ms * timing.rate;
-    let a_lit = |ms: f64| ms < timing.duration_ms;
+    let a_lit = |ms: f64| ms < timing.duration_ms && !looping.as_ref().is_some_and(|m| m.repeating(t.out_ms + ms));
     let b_lit = |ms: f64| ms >= 0.0;
+    let a_seam = |from: f64, to: f64| {
+        to <= timing.duration_ms && looping.as_ref().is_some_and(|m| m.offset(t.out_ms + from) != m.offset(t.out_ms + to))
+    };
     let selected = |f: Field| editor.field == f;
     let lane_label = |name: &str, f: Field| {
         Line::from(Span::styled(format!(" {name}"), if selected(f) { bold(accent()) } else { subtle() }))
@@ -394,13 +748,21 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     let first = lines.len();
     lines.push(lane_label(&format!("A leaves at {} (beat {})", clock_tenths(t.out_ms), beat_label(ga, t.out_ms)), Field::Out));
     lines.extend(lane(waveforms.get(&detail.from.song.id), &a_pos, &a_lit, 3));
-    lines.push(ruler(ga, &a_pos, &a_lit));
+    lines.push(ruler(ga, &|ms| t.out_ms + ms, &a_lit, &a_seam));
     hits.add(mouse::rows(area, first, lines.len() - first), Target::Lane(Field::Out, ms_per_col));
     let first = lines.len();
     lines.push(lane_label(&format!("B enters at {} (beat {})", clock_tenths(t.in_ms), beat_label(gb, t.in_ms)), Field::In));
     lines.extend(lane(waveforms.get(&detail.to.song.id), &b_pos, &b_lit, 3));
-    lines.push(ruler(gb, &b_pos, &b_lit));
+    lines.push(ruler(gb, &b_pos, &b_lit, &|_, _| false));
     hits.add(mouse::rows(area, first, lines.len() - first), Target::Lane(Field::In, ms_per_col * timing.rate));
+    lines.push(Line::raw(""));
+
+    if let Some(drawing) = editor.drawing {
+        let plot = Plot { width, t0, ms_per_col, duration_ms: timing.duration_ms, head_col };
+        draw_curves(&mut lines, area, hits, t, drawing, &plot);
+        frame.render_widget(Paragraph::new(lines).style(Style::new().bg(PANEL)), area);
+        return;
+    }
 
     // Automation curves.
     // A deck that isn't playing shows as fully off in every lane.
@@ -411,13 +773,15 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         } else if ms >= timing.duration_ms {
             (silent, DeckFx::FLAT)
         } else {
-            let p = t.at((ms / timing.duration_ms) as f32);
-            (p.out, p.inc)
+            let m = t.at((ms / timing.duration_ms) as f32);
+            (m.out, m.inc)
         }
     };
     let curve = |name: &str, f: Field, value: &dyn Fn(&DeckFx) -> f32| -> Line<'static> {
-        let label_style = if selected(f) { bold(accent()) } else { subtle() };
-        let mut spans = vec![Span::styled(format!("{name:<4}"), label_style)];
+        let custom = f.lane().is_some_and(|lane| !custom_on(t, lane).is_empty());
+        let color = if custom { Style::new().fg(WARN) } else if selected(f) { accent() } else { subtle() };
+        let label_style = if selected(f) { bold(color) } else { color };
+        let mut spans = vec![Span::styled(format!(" {name:<3}"), label_style)];
         for c in 0..width.saturating_sub(2) {
             let (a, b) = point(col_time(c + 2));
             let (va, vb) = (value(&a).clamp(0.0, 1.0), value(&b).clamp(0.0, 1.0));
@@ -425,12 +789,12 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         }
         Line::from(spans)
     };
-    lines.push(Line::raw(""));
     let first = lines.len();
-    lines.push(curve(" VOL", Field::Volume, &|d| d.gain));
-    lines.push(curve(" LOW", Field::Eq, &|d| d.eq[0]));
-    lines.push(curve(" FX", Field::Effect, &|d| d.filter.abs().max(d.echo).max(1.0 - d.speed)));
-    for (k, f) in [Field::Volume, Field::Eq, Field::Effect].into_iter().enumerate() {
+    lines.push(curve("VOL", Field::Volume, &|d| d.gain));
+    lines.push(curve("EQ", Field::Eq, &|d| d.eq[0]));
+    lines.push(curve("FLT", Field::Filter, &|d| d.filter.abs().max(d.noise)));
+    lines.push(curve("FX", Field::Effect, &|d| d.send));
+    for (k, f) in [Field::Volume, Field::Eq, Field::Filter, Field::Effect].into_iter().enumerate() {
         hits.add(mouse::rows(area, first + k, 1), Target::Field(f));
     }
     lines.push(Line::from(vec![
@@ -438,6 +802,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         Span::styled("▀ A (outgoing)", Style::new().fg(GREEN)),
         Span::styled("   ▄ B (incoming)", Style::new().fg(PURPLE)),
         Span::styled("   █ both", Style::new().fg(TEXT)),
+        Span::styled("   yellow: drawn by hand", Style::new().fg(WARN)),
     ]));
     lines.push(Line::raw(""));
 
@@ -458,15 +823,34 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         (true, None) => "needs both tempos".into(),
         (false, _) => "tempos left alone".into(),
     };
+    let curve_note = |f: Field, extra: String| -> String {
+        let Some(lane) = f.lane() else { return extra };
+        let custom = custom_on(t, lane);
+        let drawn = if custom.is_empty() { String::new() } else { format!("curve drawn by hand on {custom}") };
+        let hint = if selected(f) && [Track::Out, Track::In].iter().any(|&k| t.curve(lane, k).is_some()) { "c to draw your own" } else { "" };
+        [extra, drawn, hint.into()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
+    };
+    let effect_note = match t.effect.kind() {
+        Some(_) if t.effect.rings_out() => "on A, and rings on after the window".into(),
+        Some(_) => "on A, cut where the window ends".into(),
+        None => String::new(),
+    };
+    let loop_note = match t.looping {
+        Looping::None => String::new(),
+        Looping::Halving => "A repeats from the window's start, half as long each time".into(),
+        _ => "A repeats from the window's start until B takes over".into(),
+    };
     let fields = [
-        (Field::Preset, "Preset", t.preset.label().into(), if t.preset == Preset::Custom { "your own curves".into() } else { t.preset.description().into() }),
+        (Field::Preset, "Preset", t.preset.label().into(), if t.preset == Preset::Custom { "your own styles and curves".into() } else { t.preset.description().into() }),
         (Field::Length, "Length", bars(t.bars), format!("{:.1} s", timing.duration_ms / 1000.0)),
         (Field::Sync, "Sync", if t.sync { "on".into() } else { "off".into() }, sync_note),
         (Field::Out, "A out", clock_tenths(t.out_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()),
         (Field::In, "B in", clock_tenths(t.in_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()),
-        (Field::Volume, "Volume", t.volume.label().into(), String::new()),
-        (Field::Eq, "EQ", t.eq.label().into(), String::new()),
-        (Field::Effect, "Effect", t.effect.label().into(), String::new()),
+        (Field::Volume, "Volume", t.volume.label().into(), curve_note(Field::Volume, String::new())),
+        (Field::Eq, "EQ", t.eq.label().into(), curve_note(Field::Eq, String::new())),
+        (Field::Filter, "Filter", t.filter.label().into(), curve_note(Field::Filter, String::new())),
+        (Field::Effect, "Effects", t.effect.label().into(), curve_note(Field::Effect, effect_note)),
+        (Field::Looping, "Looping", t.looping.label().into(), loop_note),
     ];
     for (f, name, value, note) in fields {
         let line = field(f, name, value, note);
@@ -494,9 +878,137 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     hits.add(mouse::columns(row, x, "0 automatic".len()), Target::Automatic);
     presets.push(Span::styled("0 automatic", dim()));
     lines.push(Line::from(presets));
-    lines.push(Line::styled(" j/k field · h/l change · space preview loop · [ ] other transitions · s sync · +/- length · :w save · esc close", dim()));
+    lines.push(Line::styled(
+        " j/k field · h/l change · c draw curves · space preview loop · u undo · [ ] other transitions · s sync · +/- length · :w save · esc close",
+        dim(),
+    ));
 
     frame.render_widget(Paragraph::new(lines).style(Style::new().bg(PANEL)), area);
+}
+
+/// Where the timeline's columns fall, for the curves drawn by hand.
+struct Plot {
+    width: usize,
+    /// Ms from the start of the window at the left edge of column 0.
+    t0: f64,
+    ms_per_col: f64,
+    duration_ms: f64,
+    head_col: Option<isize>,
+}
+
+impl Plot {
+    /// Progress through the window at a point across column `c`.
+    fn x(&self, c: usize, across: f64) -> f64 {
+        (self.t0 + (c as f64 + across) * self.ms_per_col) / self.duration_ms
+    }
+
+    fn column(&self, x: f32) -> isize {
+        ((f64::from(x) * self.duration_ms - self.t0) / self.ms_per_col).floor() as isize
+    }
+}
+
+/// Both songs' curves for the lane being drawn, one above the other, then
+/// the point picked and the keys.
+fn draw_curves(lines: &mut Vec<Line<'static>>, area: Rect, hits: &mut Hits, t: &Transition, drawing: Drawing, plot: &Plot) {
+    let dots = PLOT_ROWS * 4;
+    let level = |v: f32| (v.clamp(0.0, 1.0) * (dots - 1) as f32).round() as usize;
+    for track in [Track::Out, Track::In] {
+        let active = track == drawing.track;
+        let color = match (track, active) {
+            (Track::Out, true) => GREEN,
+            (Track::In, true) => PURPLE,
+            _ => DIM,
+        };
+        let name = track_name(track);
+        let points = t.curve(drawing.lane, track);
+        let label = match points {
+            Some(_) if t.is_custom(drawing.lane, track) => format!(" {name}  {} · drawn by hand", drawing.lane.label()),
+            Some(_) => format!(" {name}  {} · {}", drawing.lane.label(), style_name(t, drawing.lane)),
+            None => format!(" {name}  no {} on {name}", drawing.lane.label().to_lowercase()),
+        };
+        lines.push(Line::styled(label, if active { bold(Style::new().fg(color)) } else { subtle() }));
+
+        // Braille dots, by column and then row.
+        let mut cells = vec![[0u8; PLOT_ROWS]; plot.width];
+        let mut marks: Vec<(usize, usize, bool)> = Vec::new();
+        if let Some(points) = points {
+            let mut prev: Option<usize> = None;
+            for (c, column) in cells.iter_mut().enumerate() {
+                for (half, bits) in DOTS.iter().enumerate() {
+                    let x = plot.x(c, 0.25 + 0.5 * half as f64);
+                    if !(0.0..=1.0).contains(&x) {
+                        prev = None;
+                        continue;
+                    }
+                    let now = level(curve::value(points, x as f32));
+                    // Join to the last dot so that steep parts stay unbroken.
+                    for d in prev.map_or(now, |p| p.min(now))..=prev.map_or(now, |p| p.max(now)) {
+                        let from_top = dots - 1 - d;
+                        column[from_top / 4] |= bits[from_top % 4];
+                    }
+                    prev = Some(now);
+                }
+            }
+            for (i, p) in points.iter().enumerate() {
+                let c = plot.column(p.x).clamp(0, plot.width as isize - 1) as usize;
+                let row = (dots - 1 - level(p.y)) / 4;
+                marks.push((row, c, active && i == drawing.point));
+            }
+        }
+        let first = lines.len();
+        for r in 0..PLOT_ROWS {
+            let mut spans = vec![Span::raw("  ")];
+            for (c, bits) in cells.iter().map(|column| column[r]).enumerate() {
+                let mark = marks.iter().filter(|m| m.0 == r && m.1 == c).map(|m| m.2).reduce(|a, b| a || b);
+                let span = match mark {
+                    Some(true) => Span::styled("◆", bold(Style::new().fg(WARN))),
+                    Some(false) => Span::styled("●", Style::new().fg(if active { TEXT } else { DIM })),
+                    None if plot.head_col == Some(c as isize) => Span::styled("│", Style::new().fg(TEXT)),
+                    None if bits != 0 => Span::styled(char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ').to_string(), Style::new().fg(color)),
+                    // Faint dots mark out the window.
+                    None if r == PLOT_ROWS - 1 && (0.0..=1.0).contains(&plot.x(c, 0.5)) => Span::styled("⣀", Style::new().fg(FAINT)),
+                    None => Span::raw(" "),
+                };
+                spans.push(span);
+            }
+            lines.push(Line::from(spans));
+        }
+        let rows = mouse::columns(mouse::rows(area, first, PLOT_ROWS), 2, plot.width);
+        hits.add(rows, Target::Curve { track, t0: plot.t0, ms_per_col: plot.ms_per_col, duration_ms: plot.duration_ms });
+    }
+
+    lines.push(Line::raw(""));
+    if let Some(points) = t.curve(drawing.lane, drawing.track) {
+        let i = drawing.point.min(points.len() - 1);
+        let p = points[i];
+        let ends = if i == 0 || i + 1 == points.len() { " · ends move up and down only" } else { "" };
+        let segment = if i + 1 < points.len() {
+            format!(" · {} to the next{}", if p.linear { "straight" } else { "eased" }, if p.bend == 0.0 { String::new() } else { format!(", bent {:+.0}%", p.bend * 100.0) })
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} point {} of {}", track_name(drawing.track), i + 1, points.len()), bold(text())),
+            Span::styled(
+                format!(" · {:.0}% through · {:.0}% {}{segment}{ends}", p.x * 100.0, p.y * 100.0, measure(t, drawing.lane, drawing.track)),
+                subtle(),
+            ),
+        ]));
+    }
+    lines.push(Line::styled(
+        " w/b point · h/l beat · H/L bar · ,/. nudge · j/k value · o add · x delete · s eased/straight · </> bend · Tab A/B · R style's curve · u undo · esc done",
+        dim(),
+    ));
+}
+
+/// The style that drew a lane's curves.
+fn style_name(t: &Transition, lane: Lane) -> &'static str {
+    match lane {
+        Lane::Volume => t.volume.label(),
+        Lane::Eq => t.eq.label(),
+        Lane::Filter => t.filter.label(),
+        Lane::Effect => t.effect.label(),
+    }
 }
 
 /// One cell showing two levels: the upper half for A, the lower for B.
@@ -559,8 +1071,8 @@ mod tests {
 
     #[test]
     fn cycles_wrap_both_ways() {
-        assert_eq!(cycle(&Volume::ALL, Volume::Smooth, -1), Volume::CenterCut);
-        assert_eq!(cycle(&Volume::ALL, Volume::CenterCut, 1), Volume::Smooth);
+        assert_eq!(cycle(&Volume::ALL, Volume::Smooth, -1), Volume::FadeInFastOut);
+        assert_eq!(cycle(&Volume::ALL, Volume::FadeInFastOut, 1), Volume::Smooth);
     }
 
     /// Two four-minute songs at 120 BPM, so a beat is 500 ms, with the
@@ -605,6 +1117,13 @@ mod tests {
         TransitionDetail { transition: t.clone(), saved: true, ..pair("a", "b") }
     }
 
+    fn press(ed: &mut Editor, keys: &str) {
+        for c in keys.chars() {
+            let modifiers = if c.is_ascii_uppercase() { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
+            ed.key(KeyEvent::new(KeyCode::Char(c), modifiers));
+        }
+    }
+
     #[test]
     fn edits_stay_unsaved_until_written() {
         let mut ed = editor();
@@ -636,6 +1155,121 @@ mod tests {
         ed.revert();
         assert_eq!(ed.draft.as_ref(), Some(&kept));
         assert!(!ed.modified());
+    }
+
+    #[test]
+    fn undo_and_redo_step_through_the_edits() {
+        let mut ed = editor();
+        let start = ed.draft.clone().unwrap();
+        ed.change(Field::Filter, 1, false);
+        let filtered = ed.draft.clone().unwrap();
+        ed.change(Field::Looping, 1, false);
+        assert_eq!(ed.draft.as_ref().unwrap().looping, Looping::OneBeat);
+        press(&mut ed, "u");
+        assert_eq!(ed.draft.as_ref(), Some(&filtered));
+        press(&mut ed, "u");
+        assert_eq!(ed.draft.as_ref(), Some(&start));
+        press(&mut ed, "u");
+        assert_eq!(ed.draft.as_ref(), Some(&start), "nothing more to undo");
+        ed.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(ed.draft.as_ref(), Some(&filtered));
+        // A new edit forgets what was undone.
+        ed.change(Field::Effect, 1, false);
+        ed.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(ed.draft.as_ref().unwrap().looping, Looping::None);
+    }
+
+    #[test]
+    fn edits_that_change_nothing_leave_it_automatic() {
+        let mut ed = editor();
+        // Moving a point that can't move on a curve nobody drew yet.
+        ed.field = Field::Volume;
+        ed.customize();
+        press(&mut ed, "h");
+        assert!(!ed.modified() && ed.draft.as_ref().unwrap().auto);
+    }
+
+    #[test]
+    fn drawing_a_curve_by_hand() {
+        let mut ed = editor();
+        // Blend: overlap, A's volume holds then fades from 85%.
+        assert_eq!(ed.draft.as_ref().unwrap().preset, Preset::Blend);
+        ed.field = Field::Volume;
+        assert!(matches!(ed.customize(), Action::None));
+        assert_eq!(ed.drawing.map(|d| (d.lane, d.track, d.point)), Some((Lane::Volume, Track::Out, 0)));
+        // To the middle point, down 25% twice, a bar earlier.
+        press(&mut ed, "wJJH");
+        let points = ed.points().unwrap().to_vec();
+        assert_eq!(points.len(), 3);
+        assert!((points[1].y - 0.5).abs() < 1e-6);
+        // 0.85 of a 32-beat window, on the nearest beat (27), then 4 beats back.
+        assert!((points[1].x - 23.0 / 32.0).abs() < 1e-6, "{}", points[1].x);
+        let t = ed.draft.as_ref().unwrap();
+        assert_eq!(t.preset, Preset::Custom);
+        assert!(t.is_custom(Lane::Volume, Track::Out) && !t.is_custom(Lane::Volume, Track::In));
+
+        // Add one after it, make that segment straight, bend it, then take it out again.
+        press(&mut ed, "os>");
+        let added = ed.points().unwrap()[2];
+        assert_eq!(ed.points().unwrap().len(), 4);
+        assert!(added.linear && added.bend > 0.0);
+        press(&mut ed, "x");
+        assert_eq!(ed.points().unwrap().len(), 3);
+        // The ends stay.
+        press(&mut ed, "0x$x");
+        assert_eq!(ed.points().unwrap().len(), 3);
+
+        // B's curve is separate; R puts the style's back.
+        ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ed.drawing.unwrap().track, Track::In);
+        ed.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        press(&mut ed, "R");
+        assert!(ed.draft.as_ref().unwrap().curves.is_empty());
+
+        // Esc goes back to the fields, and the field keys work again.
+        ed.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ed.drawing.is_none());
+        assert!(matches!(ed.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Action::Close));
+    }
+
+    #[test]
+    fn styles_without_curves_have_nothing_to_draw() {
+        let mut ed = editor();
+        ed.field = Field::Effect;
+        assert!(matches!(ed.customize(), Action::Error(_)), "Blend has no effect");
+        ed.field = Field::Sync;
+        assert!(matches!(ed.customize(), Action::Error(_)));
+        // A filter only on B starts on B.
+        ed.field = Field::Filter;
+        ed.edit(false, |t| t.set_filter(Filter::LowPassIn));
+        ed.customize();
+        assert_eq!(ed.drawing.unwrap().track, Track::In);
+        ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ed.drawing.unwrap().track, Track::In, "A has no filter to switch to");
+        // Undoing to a style with no curve stops the drawing.
+        press(&mut ed, "u");
+        assert!(ed.drawing.is_none());
+    }
+
+    #[test]
+    fn mouse_picks_drags_and_adds_points() {
+        let mut ed = editor();
+        ed.field = Field::Eq;
+        ed.customize();
+        // Blend's bass on A: full until 60%, gone at the end.
+        assert!(ed.click_curve(Track::Out, 0.58, 0.03, false));
+        assert_eq!(ed.drawing.unwrap().point, 1);
+        ed.drag_point(0.3, 0.9, 0.0);
+        ed.drag_point(0.49, 0.2, 0.02);
+        let p = ed.points().unwrap()[1];
+        assert!((p.x - 0.5).abs() < 1e-6 && (p.y - 0.2).abs() < 1e-6, "snapped to the middle: {p:?}");
+        // One drag, one undo step.
+        press(&mut ed, "u");
+        assert!(ed.draft.as_ref().unwrap().curves.is_empty());
+        assert!(!ed.click_curve(Track::Out, 0.3, 0.03, false), "nothing near");
+        assert!(ed.click_curve(Track::Out, 0.3, 0.03, true));
+        assert_eq!(ed.points().unwrap().len(), 4);
+        assert_eq!(ed.drawing.unwrap().point, 1);
     }
 
     #[test]

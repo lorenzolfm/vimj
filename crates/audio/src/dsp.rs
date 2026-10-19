@@ -1,5 +1,6 @@
 //! Building blocks for the decks: parameter smoothing, filters, a three-band
-//! isolator EQ, a DJ-style filter knob, an echo and the master clipper.
+//! isolator EQ, a DJ-style filter knob, an echo, a reverb, a noise sweep and
+//! the master clipper.
 
 use std::f32::consts::PI;
 
@@ -216,7 +217,39 @@ impl Filter {
     }
 }
 
-/// A feedback delay, timed to the beat, whose tail rings on after its input stops.
+/// Below this, effect tails count as died away.
+const SILENCE: f32 = 1e-4;
+
+/// Fades a cut effect tail out quickly instead of stopping it dead.
+#[derive(Clone, Copy, Debug)]
+struct Kill {
+    gain: Smooth,
+    cutting: bool,
+}
+
+impl Kill {
+    fn new(rate: u32) -> Kill {
+        Kill { gain: Smooth::new(1.0, 0.005, rate), cutting: false }
+    }
+
+    /// Gain for the wet signal; `Some(true)` once a cut has faded all the way.
+    #[inline]
+    fn next(&mut self) -> (f32, bool) {
+        if !self.cutting {
+            return (1.0, false);
+        }
+        let g = self.gain.next(0.0);
+        if g >= SILENCE {
+            return (g, false);
+        }
+        self.cutting = false;
+        self.gain.set(1.0);
+        (0.0, true)
+    }
+}
+
+/// A feedback delay, timed to the beat, whose tail rings on after its input
+/// stops. With no feedback it repeats once.
 pub struct Echo {
     buffer: Vec<[f32; 2]>,
     write: usize,
@@ -225,7 +258,11 @@ pub struct Echo {
     send: Smooth,
     /// Peak level in the delay line recently, to know when the tail has died.
     level: f32,
+    kill: Kill,
 }
+
+/// How much of each repeat feeds the next one.
+pub const ECHO_FEEDBACK: f32 = 0.55;
 
 impl Echo {
     pub fn new(rate: u32) -> Echo {
@@ -233,9 +270,10 @@ impl Echo {
             buffer: vec![[0.0; 2]; rate as usize * 2],
             write: 0,
             delay: rate as usize / 2,
-            feedback: 0.55,
+            feedback: ECHO_FEEDBACK,
             send: Smooth::new(0.0, 0.01, rate),
             level: 0.0,
+            kill: Kill::new(rate),
         }
     }
 
@@ -243,11 +281,15 @@ impl Echo {
         self.delay = frames.clamp(1, self.buffer.len() - 1);
     }
 
+    pub fn set_feedback(&mut self, feedback: f32) {
+        self.feedback = feedback.clamp(0.0, 0.95);
+    }
+
     /// Adds the echo of `input` (the send) to `dry`.
     #[inline]
     pub fn process(&mut self, dry: [f32; 2], input: [f32; 2], send_target: f32) -> [f32; 2] {
         let send = self.send.next(send_target);
-        if send < 1e-4 && self.level < 1e-4 {
+        if send < SILENCE && self.level < SILENCE {
             self.level = 0.0;
             return dry;
         }
@@ -257,11 +299,189 @@ impl Echo {
         self.buffer[self.write] = [input[0] * send + wet[0] * self.feedback, input[1] * send + wet[1] * self.feedback];
         self.write = (self.write + 1) % len;
         self.level = (self.level * 0.9999).max(wet[0].abs().max(wet[1].abs()));
-        [dry[0] + wet[0], dry[1] + wet[1]]
+        let (kill, done) = self.kill.next();
+        if done {
+            self.buffer.fill([0.0; 2]);
+            self.level = 0.0;
+        }
+        [dry[0] + wet[0] * kill, dry[1] + wet[1] * kill]
+    }
+
+    /// Stops the tail ringing.
+    pub fn cut(&mut self) {
+        self.kill.cutting = self.ringing();
     }
 
     pub fn ringing(&self) -> bool {
-        self.level >= 1e-4
+        self.level >= SILENCE
+    }
+}
+
+/// One comb of the reverb: a delay line feeding back through a low-pass.
+struct Comb {
+    buffer: Vec<f32>,
+    at: usize,
+    store: f32,
+}
+
+impl Comb {
+    #[inline]
+    fn process(&mut self, x: f32, feedback: f32, damp: f32) -> f32 {
+        let out = self.buffer[self.at];
+        self.store = out * (1.0 - damp) + self.store * damp;
+        self.buffer[self.at] = x + self.store * feedback;
+        self.at = (self.at + 1) % self.buffer.len();
+        out
+    }
+}
+
+/// One all-pass diffuser of the reverb.
+struct Diffuser {
+    buffer: Vec<f32>,
+    at: usize,
+}
+
+impl Diffuser {
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let delayed = self.buffer[self.at];
+        self.buffer[self.at] = x + delayed * 0.5;
+        self.at = (self.at + 1) % self.buffer.len();
+        delayed - x
+    }
+}
+
+/// Comb and all-pass lengths of Freeverb, in frames at 44.1 kHz.
+const COMBS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+const DIFFUSERS: [usize; 4] = [556, 441, 341, 225];
+/// The right channel's lines are this much longer, for width.
+const SPREAD: usize = 23;
+/// A large room: about two and a half seconds to die away.
+const ROOM_FEEDBACK: f32 = 0.92;
+const ROOM_DAMP: f32 = 0.25;
+const REVERB_INPUT: f32 = 0.015;
+const REVERB_WET: f32 = 1.0;
+
+/// A Schroeder–Moorer reverb with Freeverb's tuning, whose tail rings on
+/// after its input stops.
+pub struct Reverb {
+    combs: [Vec<Comb>; 2],
+    diffusers: [Vec<Diffuser>; 2],
+    send: Smooth,
+    level: f32,
+    kill: Kill,
+}
+
+impl Reverb {
+    pub fn new(rate: u32) -> Reverb {
+        let frames = |n: usize| ((n as f32 * rate as f32 / 44_100.0) as usize).max(1);
+        let combs = |spread: usize| -> Vec<Comb> { COMBS.map(|n| Comb { buffer: vec![0.0; frames(n + spread)], at: 0, store: 0.0 }).into() };
+        let diffusers = |spread: usize| -> Vec<Diffuser> { DIFFUSERS.map(|n| Diffuser { buffer: vec![0.0; frames(n + spread)], at: 0 }).into() };
+        Reverb {
+            combs: [combs(0), combs(SPREAD)],
+            diffusers: [diffusers(0), diffusers(SPREAD)],
+            send: Smooth::new(0.0, 0.01, rate),
+            level: 0.0,
+            kill: Kill::new(rate),
+        }
+    }
+
+    /// Adds the reverb of `input` (the send) to `dry`.
+    #[inline]
+    pub fn process(&mut self, dry: [f32; 2], input: [f32; 2], send_target: f32) -> [f32; 2] {
+        let send = self.send.next(send_target);
+        if send < SILENCE && self.level < SILENCE {
+            self.level = 0.0;
+            return dry;
+        }
+        let x = (input[0] + input[1]) * send * REVERB_INPUT;
+        let mut wet = [0.0; 2];
+        for (c, out) in wet.iter_mut().enumerate() {
+            let mut sum = 0.0;
+            for comb in &mut self.combs[c] {
+                sum += comb.process(x, ROOM_FEEDBACK, ROOM_DAMP);
+            }
+            for d in &mut self.diffusers[c] {
+                sum = d.process(sum);
+            }
+            *out = sum * REVERB_WET;
+        }
+        self.level = (self.level * 0.9999).max(wet[0].abs().max(wet[1].abs()));
+        let (kill, done) = self.kill.next();
+        if done {
+            self.clear();
+        }
+        [dry[0] + wet[0] * kill, dry[1] + wet[1] * kill]
+    }
+
+    fn clear(&mut self) {
+        for comb in self.combs.iter_mut().flatten() {
+            comb.buffer.fill(0.0);
+            comb.store = 0.0;
+        }
+        for d in self.diffusers.iter_mut().flatten() {
+            d.buffer.fill(0.0);
+        }
+        self.level = 0.0;
+    }
+
+    /// Stops the tail ringing.
+    pub fn cut(&mut self) {
+        self.kill.cutting = self.ringing();
+    }
+
+    pub fn ringing(&self) -> bool {
+        self.level >= SILENCE
+    }
+}
+
+/// Peak of the noise sweep at full amount.
+const NOISE_LEVEL: f32 = 0.3;
+
+/// White noise through a low-pass that opens as the amount rises: a riser
+/// that gets louder and brighter.
+pub struct Noise {
+    seed: u32,
+    lp: Svf,
+    amount: Smooth,
+    rate: u32,
+    counter: u32,
+}
+
+impl Noise {
+    pub fn new(rate: u32) -> Noise {
+        Noise { seed: 0x9E37_79B9, lp: Svf::default(), amount: Smooth::new(0.0, 0.01, rate), rate, counter: 0 }
+    }
+
+    /// Cutoff of the noise at an amount.
+    pub fn cutoff(amount: f32) -> f32 {
+        300.0 * (14_000.0f32 / 300.0).powf(amount.clamp(0.0, 1.0))
+    }
+
+    #[inline]
+    pub fn process(&mut self, target: f32) -> [f32; 2] {
+        let amount = self.amount.next(target);
+        if amount < SILENCE {
+            return [0.0; 2];
+        }
+        if self.counter == 0 {
+            self.lp.tune(Self::cutoff(amount), FILTER_Q, self.rate);
+        }
+        self.counter = (self.counter + 1) % RETUNE_EVERY;
+        let mut out = [0.0; 2];
+        for (c, y) in out.iter_mut().enumerate() {
+            // Xorshift: plenty for noise.
+            self.seed ^= self.seed << 13;
+            self.seed ^= self.seed >> 17;
+            self.seed ^= self.seed << 5;
+            let white = self.seed as f32 / u32::MAX as f32 * 2.0 - 1.0;
+            *y = self.lp.process(c, white).0 * amount * NOISE_LEVEL;
+        }
+        out
+    }
+
+    pub fn sounding(&self) -> bool {
+        self.amount.value() >= SILENCE
     }
 }
 
@@ -345,6 +565,67 @@ mod tests {
         let mut silent = Echo::new(RATE);
         assert!(!silent.ringing());
         assert_eq!(silent.process([0.3; 2], [0.3; 2], 0.0), [0.3; 2]);
+    }
+
+    #[test]
+    fn delay_repeats_once() {
+        let mut delay = Echo::new(RATE);
+        delay.set_delay(1_000);
+        delay.set_feedback(0.0);
+        let out: Vec<f32> = (0..5_000).map(|i| delay.process([0.0; 2], [if i == 0 { 1.0 } else { 0.0 }; 2], 1.0)[0]).collect();
+        assert!(out[1_000] > 0.0);
+        assert!(out[2_000..].iter().all(|&x| x == 0.0));
+    }
+
+    /// Runs an effect over a second of noise into silence; returns the RMS
+    /// of the input, of the tail half a second on, and of the tail after `cut`.
+    fn tail(mut effect: impl FnMut([f32; 2], f32) -> [f32; 2], mut cut: impl FnMut()) -> (f32, f32, f32) {
+        let mut seed = 1u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32 - 0.5
+        };
+        let rms = |xs: &[f32]| (xs.iter().map(|x| x * x).sum::<f32>() / xs.len() as f32).sqrt();
+        let input: Vec<f32> = (0..RATE).map(|_| noise()).collect();
+        for &x in &input {
+            effect([x; 2], 1.0);
+        }
+        let on: Vec<f32> = (0..RATE / 2).map(|_| effect([0.0; 2], 0.0)[0]).collect();
+        cut();
+        let after: Vec<f32> = (0..RATE / 10).map(|_| effect([0.0; 2], 0.0)[0]).collect();
+        (rms(&input), rms(&on[RATE as usize / 4..]), rms(&after[RATE as usize / 20..]))
+    }
+
+    #[test]
+    fn reverb_rings_on_until_cut() {
+        let reverb = std::cell::RefCell::new(Reverb::new(RATE));
+        let (input, ringing, cut) = tail(|x, send| reverb.borrow_mut().process([0.0; 2], x, send), || reverb.borrow_mut().cut());
+        assert!(ringing > input * 0.05 && ringing < input * 2.0, "{ringing} vs {input}");
+        assert_eq!(cut, 0.0);
+        assert!(!reverb.borrow().ringing());
+        let mut dry = Reverb::new(RATE);
+        assert_eq!(dry.process([0.3; 2], [0.3; 2], 0.0), [0.3; 2]);
+    }
+
+    #[test]
+    fn echo_rings_on_until_cut() {
+        let echo = std::cell::RefCell::new(Echo::new(RATE));
+        echo.borrow_mut().set_delay(12_000);
+        let (input, ringing, cut) = tail(|x, send| echo.borrow_mut().process([0.0; 2], x, send), || echo.borrow_mut().cut());
+        assert!(ringing > input * 0.1, "{ringing} vs {input}");
+        assert_eq!(cut, 0.0);
+    }
+
+    #[test]
+    fn noise_gets_louder_and_brighter() {
+        let level = |amount: f32| {
+            let mut n = Noise::new(RATE);
+            let out: Vec<f32> = (0..RATE / 2).map(|_| n.process(amount)[0]).collect();
+            rms_tail(&out)
+        };
+        assert_eq!(level(0.0), 0.0);
+        assert!(level(1.0) > level(0.5) * 1.5 && level(0.5) > 0.0);
+        assert!(Noise::cutoff(1.0) > 10_000.0 && Noise::cutoff(0.0) < 500.0);
     }
 
     #[test]
