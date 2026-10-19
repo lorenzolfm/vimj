@@ -5,7 +5,8 @@
 //! other. Transitions belong to a pair of songs, so a pair tuned once sounds
 //! the same wherever it occurs; pairs nobody edited get an automatic one.
 
-use crate::config::{load_json, save_json};
+use crate::config::{load_json, save_json, write_atomic};
+use anyhow::Context;
 use vimj_audio::engine::{Entry, normalising_gain};
 use vimj_core::compat::{Compat, compat};
 use vimj_core::order;
@@ -91,6 +92,19 @@ fn pair_key(from: &str, to: &str) -> String {
     format!("{from}>{to}")
 }
 
+/// Copies a library in an older format aside before this build saves its own
+/// over it: older builds can't read that, and start over empty. The first
+/// copy of each format is the one kept.
+fn keep_for_older_builds(path: &Path, version: u32) -> anyhow::Result<()> {
+    let copy = path.with_extension(format!("v{version}.json"));
+    if !copy.exists() {
+        let keep = || write_atomic(&copy, &std::fs::read(path)?);
+        keep().with_context(|| format!("copying {} to {}", path.display(), copy.display()))?;
+        tracing::info!("kept the library as older vimj builds read it in {}", copy.display());
+    }
+    Ok(())
+}
+
 impl Library {
     /// Reads the library, or starts an empty one where there is none yet. A
     /// library this build can't read is an error, so that nothing saves over it.
@@ -107,7 +121,10 @@ impl Library {
             anyhow::bail!("{} is from a newer vimj (format {version}; this one reads up to {STORE_VERSION})", path.display());
         }
         let mut store: Store = load_json(&path)?.unwrap_or_default();
-        store.version = STORE_VERSION;
+        if store.version < STORE_VERSION {
+            keep_for_older_builds(&path, store.version)?;
+            store.version = STORE_VERSION;
+        }
         Ok(Library { path, store, states: HashMap::new(), history: HashMap::new() })
     }
 
@@ -588,13 +605,22 @@ mod tests {
     }
 
     #[test]
-    fn libraries_without_a_format_number_load_and_get_one() {
+    fn libraries_without_a_format_number_load_get_one_and_are_kept_for_older_builds() {
         let path = library_file("old");
+        let kept = path.with_file_name("library.v0.json");
         assert!(Library::load(path.clone()).unwrap().songs().is_empty(), "no file yet");
-        std::fs::write(&path, r#"{"songs": [], "next_playlist": 3}"#).unwrap();
+        assert!(!kept.exists(), "nothing to keep");
+        let old = r#"{"songs": [], "next_playlist": 3}"#;
+        std::fs::write(&path, old).unwrap();
         Library::load(path.clone()).unwrap().save();
         let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["version"], STORE_VERSION);
+        // Older builds can't read that and would start over empty: they get the file as it was.
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), old);
+        // An older build wrote the library again since; the first copy stays.
+        std::fs::write(&path, r#"{"songs": []}"#).unwrap();
+        Library::load(path).unwrap();
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), old);
     }
 
     #[test]

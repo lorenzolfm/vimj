@@ -202,7 +202,9 @@ responses and the events streamed from `GET /api/events`, so a web or desktop fr
 
 State lives in `~/.config/vimj/config.toml` (music folder, tool paths, browser for cookies, volume)
 and `~/.local/share/vimj/` (the library, waveforms, `vimjd.log`). If `vimjd` can't read the library,
-say one a newer vimj wrote, it stops and says why in `vimjd.log` rather than start over empty.
+say one a newer vimj wrote, it stops and says why in `vimjd.log` rather than start over empty. Older
+builds don't check, so before `vimjd` first saves a library from an older vimj it keeps a copy as it
+was, `library.v0.json`: put that back as `library.json` before running an older build.
 
 `cargo run --release -p vimj-audio --example analyze -- FILE…` prints what analysis finds in files;
 `--example render -- FROM TO OUT.wav [PRESET] [BARS]` renders a transition to listen to. `vimjd

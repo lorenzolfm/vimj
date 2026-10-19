@@ -109,8 +109,9 @@ pub struct Editor {
     /// Drafts before each edit, and those `u` stepped back over.
     undo: Vec<Transition>,
     redo: Vec<Transition>,
-    /// A mouse drag of a curve point already made its undo step.
-    dragged: bool,
+    /// The draft as a mouse drag of a curve point found it, until the drag
+    /// changes it: that is then the drag's one undo step.
+    drag_from: Option<Transition>,
     /// When the draft last changed, until a running preview hears of it.
     changed_at: Option<Instant>,
     /// The last edit moved the window, so a running preview should start over.
@@ -140,7 +141,7 @@ impl Editor {
             mode: Mode::Fields(Field::Preset),
             undo: Vec::new(),
             redo: Vec::new(),
-            dragged: false,
+            drag_from: None,
             changed_at: None,
             restart_preview: false,
             previewing: false,
@@ -566,24 +567,20 @@ impl Editor {
             }
             self.mode = Mode::Drawing(Drawing { track, point: 0, ..d });
         }
-        self.dragged = false;
         if double {
             self.edit_curve(true, |c, i| {
                 if let Some(at) = c.insert(x) {
                     *i = at;
                 }
             });
-            return true;
+        } else {
+            let Some(points) = self.points() else { return false };
+            let nearest = (0..points.len()).min_by(|&a, &b| (points[a].x - x).abs().total_cmp(&(points[b].x - x).abs()));
+            let Some(i) = nearest.filter(|&i| (points[i].x - x).abs() <= reach) else { return false };
+            self.pick_point(i);
         }
-        let Some(points) = self.points() else { return false };
-        let nearest = (0..points.len()).min_by(|&a, &b| (points[a].x - x).abs().total_cmp(&(points[b].x - x).abs()));
-        match nearest.filter(|&i| (points[i].x - x).abs() <= reach) {
-            Some(i) => {
-                self.pick_point(i);
-                true
-            }
-            None => false,
-        }
+        self.drag_from = self.draft.clone();
+        true
     }
 
     /// Drags the picked point to (`x`, `y`), onto a beat or the middle when
@@ -592,8 +589,10 @@ impl Editor {
         let per = self.window_beats();
         let on_beat = (x * per).round() / per;
         let x = [on_beat, 0.5].into_iter().find(|s| (s - x).abs() <= snap).unwrap_or(x);
-        let record = !std::mem::replace(&mut self.dragged, true);
-        self.edit_curve(record, |c, i| c.move_point(*i, x, y));
+        self.edit_curve(false, |c, i| c.move_point(*i, x, y));
+        if let Some(from) = self.drag_from.take_if(|from| self.draft.as_ref() != Some(&*from)) {
+            self.remember(from);
+        }
     }
 }
 
@@ -976,7 +975,7 @@ fn draw_curves(lines: &mut Vec<Line<'static>>, area: Rect, hits: &mut Hits, t: &
                 }
             }
             for (i, p) in points.iter().enumerate() {
-                let c = plot.column(p.x).clamp(0, plot.width as isize - 1) as usize;
+                let c = plot.column(p.x).clamp(0, plot.width.saturating_sub(1) as isize) as usize;
                 let row = (dots - 1 - level(p.y)) / 4;
                 marks.push((row, c, active && i == drawing.point));
             }
@@ -1299,6 +1298,14 @@ mod tests {
         assert!(ed.click_curve(Track::Out, 0.3, 0.03, true));
         assert_eq!(ed.points().unwrap().len(), 4);
         assert_eq!(ed.drawing().unwrap().point, 1);
+        // A drag that starts by changing nothing is still a step of its own.
+        press(&mut ed, "0j");
+        let lowered = ed.points().unwrap()[0].y;
+        assert!(ed.click_curve(Track::Out, 0.0, 0.03, false));
+        ed.drag_point(0.01, lowered, 0.0);
+        ed.drag_point(0.01, 0.4, 0.0);
+        press(&mut ed, "u");
+        assert_eq!(ed.points().unwrap()[0].y, lowered, "back to before the drag, not before the j");
     }
 
     #[test]
