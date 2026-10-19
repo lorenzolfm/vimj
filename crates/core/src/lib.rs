@@ -5,6 +5,7 @@
 
 pub mod camelot;
 pub mod compat;
+pub mod curve;
 pub mod meta;
 pub mod model;
 pub mod order;

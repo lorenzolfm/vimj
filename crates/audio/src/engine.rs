@@ -17,8 +17,6 @@ use std::sync::Arc;
 const BLOCK: usize = 64;
 /// After a synced transition the new song eases back to its own tempo over this many beats.
 const GLIDE_BEATS: f64 = 16.0;
-/// Echo repeats at this fraction of a beat (a dotted eighth).
-const ECHO_BEATS: f64 = 0.75;
 /// Decoded songs kept around beyond the ones in use.
 const CACHE: usize = 4;
 /// "Previous" restarts the song instead when it has played longer than this.
@@ -438,15 +436,24 @@ impl Engine {
         let mut deck = Deck::new(pcm, b_position, b_tempo, self.level(index + 1));
         let point = transition.at((elapsed_ms / total_ms) as f32);
         deck.fx = point.inc;
-        let beat_ms = self.plan.entries[index].grid.map_or(500.0, |g| g.beat_ms()) / a_tempo;
-        let echo_delay = self.frames(beat_ms * ECHO_BEATS);
         let main = self.main.as_mut().expect("checked above");
         main.deck.fx = point.out;
-        main.deck.set_echo_delay(echo_delay);
         self.incoming = Some(Slot { index: index + 1, deck });
         self.glide = None;
         self.active = Some(Active { transition, elapsed: self.frames(elapsed_ms), total: self.frames(total_ms) });
+        self.arm_outgoing();
         let _ = self.pcm(index + 2);
+    }
+
+    /// Gives the outgoing deck the effect and loop of the transition under way.
+    fn arm_outgoing(&mut self) {
+        let (Some(active), Some(main)) = (&self.active, self.main.as_mut()) else { return };
+        let grid = self.plan.entries[main.index].grid;
+        let per_ms = f64::from(self.rate) / 1000.0;
+        // Echoes repeat in beats as heard, at the deck's tempo.
+        let beat_ms = grid.map_or(500.0, |g| g.beat_ms()) / main.deck.tempo();
+        main.deck.set_effect(active.transition.effect.kind(), beat_ms * per_ms);
+        main.deck.set_loop(active.transition.loop_map(grid.as_ref()).map(|m| m.scaled(per_ms)));
     }
 
     fn automate(&mut self) {
@@ -502,8 +509,8 @@ impl Engine {
         let Some(active) = self.active.take() else { return };
         if let Some(mut old) = self.main.take() {
             old.deck.retire();
-            if !active.transition.effect.has_tail() {
-                old.deck.set_echo_delay(1.0);
+            if !active.transition.effect.rings_out() {
+                old.deck.cut_tail();
             }
             self.tails.push(old.deck);
         }
@@ -568,15 +575,16 @@ impl Engine {
         let next_id = self.plan.entries.get(index + 1).map(|e| e.id.clone());
         match (&mut self.active, coming) {
             (Some(active), Some(coming)) if next_id.as_deref() == Some(&coming) => {
-                // Same pair: keep going, with the new curves.
+                // Same pair: keep going, with the new styles and curves. The
+                // window under way keeps its timing, which its loop follows.
                 if let Some(t) = &self.plan.entries[index].next {
-                    active.transition.volume = t.volume;
-                    active.transition.eq = t.eq;
-                    active.transition.effect = t.effect;
+                    let now = &active.transition;
+                    active.transition = Transition { bars: now.bars, out_ms: now.out_ms, in_ms: now.in_ms, sync: now.sync, ..t.clone() };
                 }
                 if let Some(i) = self.incoming.as_mut() {
                     i.index = index + 1;
                 }
+                self.arm_outgoing();
             }
             (Some(_), _) => {
                 self.active = None;
@@ -584,8 +592,10 @@ impl Engine {
                     i.deck.retire();
                     self.tails.push(i.deck);
                 }
+                // The transition is off, and its loop with it.
                 if let Some(m) = self.main.as_mut() {
                     m.deck.fx = DeckFx::FLAT;
+                    m.deck.set_loop(None);
                 }
             }
             _ => {}
@@ -600,7 +610,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vimj_core::transition::{Effect, Eq, Preset, Volume};
+    use vimj_core::transition::{Curves, Effect, Eq, Filter, Looping, Preset, Volume};
 
     const RATE: u32 = 48_000;
 
@@ -632,10 +642,12 @@ mod tests {
 
     fn blend(out_ms: f64, in_ms: f64, bars: u32) -> Transition {
         let mut t = Transition {
-            preset: Preset::Blend,
             volume: Volume::Smooth,
             eq: Eq::Off,
+            filter: Filter::None,
             effect: Effect::None,
+            looping: Looping::None,
+            curves: Curves::default(),
             bars,
             out_ms,
             in_ms,
@@ -856,6 +868,73 @@ mod tests {
         assert!((e.snapshot(0).position_ms - paused - 1_000.0).abs() < 5.0);
     }
 
+    /// A tone that changes every bar: bar `k` at `1 000 + 100 k` Hz.
+    fn stepped(seconds: f64, bpm: f64) -> Arc<Pcm> {
+        let bar = 4.0 * 60.0 / bpm;
+        let frames = (seconds * f64::from(RATE)) as usize;
+        let mut s = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let t = i as f64 / f64::from(RATE);
+            let hz = 1_000.0 + 100.0 * (t / bar).floor();
+            let v = 0.3 * (2.0 * std::f64::consts::PI * hz * t).sin() as f32;
+            s.push(v);
+            s.push(v);
+        }
+        Arc::new(Pcm::from_f32(RATE, &s))
+    }
+
+    /// A at 120 BPM leaving at `out_ms` over 4 bars, looping the first and
+    /// loud until the end, so the loop can be heard all through the window.
+    fn looping_out(out_ms: f64) -> Transition {
+        let mut t = blend(out_ms, 0.0, 4);
+        t.set_volume(Volume::FadeInCutOut);
+        t.looping = Looping::FourBeat;
+        t
+    }
+
+    #[test]
+    fn loops_the_first_bar_of_the_window() {
+        let a = stepped(40.0, 120.0);
+        let b = song(40.0, 120.0, 440.0, 5_000.0);
+        // A leaves at bar 10 (20 s, 2 000 Hz).
+        let plan = Plan { entries: vec![entry("a", 120.0, Some(looping_out(20_000.0))), entry("b", 120.0, None)], preview: None };
+        let mut e = engine(plan, &[("a", a), ("b", b)]);
+        e.command(Command::Play { index: 0, position_ms: 10_000.0 });
+        let out = run(&mut e, 18.0);
+        let bar = |k: f32| presence(&out, 1_000.0 + 100.0 * k);
+        // Before the window A moves on bar by bar; in it, bar 10 comes round again and again.
+        assert!(bar(9.0)[90] > 0.05, "bar 9 at 9 s");
+        for at in [110, 130, 150, 170] {
+            assert!(bar(10.0)[at] > 0.05, "bar 10 at {at}00 ms");
+            assert!(bar(11.0)[at] < 0.01 && bar(12.0)[at] < 0.01 && bar(13.0)[at] < 0.01, "later bars at {at}00 ms");
+        }
+    }
+
+    #[test]
+    fn effects_ring_on_after_the_window_when_out_and_stop_when_cut() {
+        let echo_after = |effect: Effect| {
+            let a = song(40.0, 120.0, 440.0, 1_000.0);
+            let b = song(40.0, 120.0, 660.0, 5_000.0);
+            let mut t = blend(20_000.0, 0.0, 2);
+            t.set_volume(Volume::FadeInCutOut);
+            t.set_effect(effect);
+            let plan = Plan { entries: vec![entry("a", 120.0, Some(t)), entry("b", 120.0, None)], preview: None };
+            let mut e = engine(plan, &[("a", a), ("b", b)]);
+            e.command(Command::Play { index: 0, position_ms: 18_000.0 });
+            // The window runs 2 s..6 s.
+            let out = run(&mut e, 7.0);
+            (presence(&out, 440.0)[50], presence(&out, 440.0)[63])
+        };
+        let (during, after) = echo_after(Effect::EchoOneOutEnd);
+        assert!(during > 0.05 && after > 0.02, "{during} {after}");
+        let (during, after) = echo_after(Effect::EchoOneCutEnd);
+        assert!(during > 0.05 && after < 0.002, "{during} {after}");
+        let (_, after) = echo_after(Effect::ReverbOutEnd);
+        assert!(after > 0.002, "{after}");
+        let (_, after) = echo_after(Effect::ReverbCutEnd);
+        assert!(after < 0.0002, "{after}");
+    }
+
     #[test]
     fn replanning_keeps_the_song_playing() {
         let a = song(30.0, 120.0, 440.0, 1_000.0);
@@ -868,5 +947,29 @@ mod tests {
         let s = e.snapshot(0);
         assert_eq!(s.index, Some(0));
         assert!((s.position_ms - 1_000.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn replanning_mid_window_keeps_the_loop_only_while_its_window_goes_on() {
+        // A loops bar 10 from 20 s; the plan changes 1.5 s into the window.
+        let replanned = |entries: Vec<Entry>| {
+            let plan = Plan { entries: vec![entry("a", 120.0, Some(looping_out(20_000.0))), entry("b", 120.0, None)], preview: None };
+            let mut e = engine(plan, &[("a", stepped(40.0, 120.0)), ("b", song(40.0, 120.0, 440.0, 5_000.0))]);
+            e.command(Command::Play { index: 0, position_ms: 19_000.0 });
+            run(&mut e, 2.5);
+            e.command(Command::SetPlan(Plan { entries, preview: None }));
+            let out = run(&mut e, 4.0);
+            move |k: f32| presence(&out, 1_000.0 + 100.0 * k)
+        };
+        // The pair saved with its window half a bar later: the window under
+        // way keeps its timing, so bar 10 keeps coming round.
+        let bar = replanned(vec![entry("a", 120.0, Some(looping_out(21_000.0))), entry("b", 120.0, None)]);
+        for at in [10, 20, 30] {
+            assert!(bar(10.0)[at] > 0.05 && bar(11.0)[at] < 0.01, "bar 10 at 21.5 s + {at}00 ms");
+        }
+        // Another song next: the transition stops, its loop with it, and A plays on.
+        let bar = replanned(vec![entry("a", 120.0, None), entry("c", 120.0, None)]);
+        assert!(bar(11.0)[10] > 0.05 && bar(10.0)[10] < 0.01, "bar 11 at 22.5 s");
+        assert!(bar(12.0)[30] > 0.05, "bar 12 at 24.5 s");
     }
 }

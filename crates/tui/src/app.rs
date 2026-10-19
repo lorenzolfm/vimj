@@ -24,6 +24,7 @@ const SCROLL_MARGIN: usize = 3;
 /// Rows one turn of the wheel scrolls.
 const SCROLL_LINES: isize = 3;
 
+#[allow(clippy::large_enum_variant)]
 pub enum Msg {
     Event(Event),
     Connected(bool),
@@ -167,6 +168,8 @@ enum Drag {
     /// Moves a cue point in the transition editor, from where it was when
     /// the button went down at `column`.
     Cue { field: Field, column: u16, from_ms: f64, ms_per_column: f64 },
+    /// Moves the picked point of a curve being drawn, over `area`.
+    Point { area: Rect, t0: f64, ms_per_col: f64, duration_ms: f64 },
 }
 
 pub struct App {
@@ -1059,7 +1062,7 @@ impl App {
         let mut editor = Editor::new(index, list.songs.len(), from.clone(), to.clone());
         if let Some(e) = &self.editor {
             editor.previewing = e.previewing;
-            editor.field = e.field;
+            editor.pick_field(e.field());
         }
         self.ensure_waveform(&from);
         self.ensure_waveform(&to);
@@ -1135,6 +1138,7 @@ impl App {
             Action::Close => self.quit_editor(false),
             Action::Command => self.mode = Mode::Command(LineInput::default()),
             Action::TogglePreview => self.toggle_preview(),
+            Action::Error(e) => self.error(e),
             Action::Pair(by) => {
                 let Some(ed) = self.editor.as_ref() else { return };
                 if ed.modified() {
@@ -1182,7 +1186,7 @@ impl App {
                 self.drag = None;
                 if let Some((area, target)) = hit {
                     let double = self.clicks.click(target);
-                    self.click(target, area, m.column, double);
+                    self.click(target, area, m.column, m.row, double);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => self.drag_to(m.column, m.row),
@@ -1202,7 +1206,7 @@ impl App {
     }
 
     /// A left click on `target`, drawn over `area`.
-    fn click(&mut self, target: Target, area: Rect, column: u16, double: bool) {
+    fn click(&mut self, target: Target, area: Rect, column: u16, row: u16, double: bool) {
         match target {
             Target::Backdrop => self.popup = None,
             Target::Popup | Target::Volume => {}
@@ -1257,18 +1261,31 @@ impl App {
                 let Some(Popup::AddTo(p)) = self.popup.take() else { return };
                 self.add_to(p, i);
             }
-            Target::Field(_) | Target::Step(..) | Target::Lane(..) | Target::Preset(_) | Target::Automatic => {
+            Target::Field(_) | Target::Step(..) | Target::Lane(..) | Target::Curve { .. } | Target::Preset(_) | Target::Automatic => {
                 let Some(ed) = self.editor.as_mut() else { return };
                 match target {
-                    Target::Field(f) => ed.field = f,
+                    Target::Field(f) => {
+                        ed.pick_field(f);
+                        if double && let Action::Error(e) = ed.customize() {
+                            self.error(e);
+                        }
+                    }
                     Target::Step(f, by) => {
-                        ed.field = f;
+                        ed.pick_field(f);
                         ed.change(f, by, false);
                     }
                     Target::Lane(f, ms_per_column) => {
-                        ed.field = f;
+                        ed.pick_field(f);
                         if let Some(from_ms) = ed.cue(f) {
                             self.drag = Some(Drag::Cue { field: f, column, from_ms, ms_per_column });
+                        }
+                    }
+                    Target::Curve { track, t0, ms_per_col, duration_ms } => {
+                        let (x, _) = curve_point(area, t0, ms_per_col, duration_ms, column, row);
+                        // Within a column and a half of a point picks it.
+                        let reach = (1.5 * ms_per_col / duration_ms) as f32;
+                        if ed.click_curve(track, x, reach, double) {
+                            self.drag = Some(Drag::Point { area, t0, ms_per_col, duration_ms });
                         }
                     }
                     Target::Preset(i) => ed.preset(Preset::ALL[i]),
@@ -1304,6 +1321,13 @@ impl App {
                     ed.drag(field, from_ms, -(f64::from(column) - f64::from(from)) * ms_per_column);
                 }
             }
+            Some(Drag::Point { area, t0, ms_per_col, duration_ms }) => {
+                if let Some(ed) = self.editor.as_mut() {
+                    let (x, y) = curve_point(area, t0, ms_per_col, duration_ms, column, row);
+                    // Half a column either side of a beat lands on it.
+                    ed.drag_point(x, y, (0.5 * ms_per_col / duration_ms) as f32);
+                }
+            }
             None => {}
         }
     }
@@ -1326,7 +1350,7 @@ impl App {
             // Up raises a value, as on a knob.
             Target::Field(f) | Target::Step(f, _) | Target::Lane(f, _) => {
                 if let Some(ed) = self.editor.as_mut() {
-                    ed.field = f;
+                    ed.pick_field(f);
                     ed.change(f, -down as i32, false);
                 }
             }
@@ -1445,6 +1469,15 @@ pub const COMMANDS: [&str; 24] = [
     "add", "artist", "clear", "cookies", "delete", "download", "help", "new", "q", "q!", "quit", "redo", "rename",
     "reorder", "rescan", "seek", "smart", "stop", "title", "undo", "vol", "w", "wq", "x",
 ];
+
+/// Where a click at (`column`, `row`) lands on a curve drawn over `area`:
+/// how far through the window, and the value there.
+fn curve_point(area: Rect, t0: f64, ms_per_col: f64, duration_ms: f64, column: u16, row: u16) -> (f32, f32) {
+    let across = f64::from(column.saturating_sub(area.x)) + 0.5;
+    let x = (t0 + across * ms_per_col) / duration_ms;
+    let down = f64::from(row.saturating_sub(area.y)) / f64::from(area.height.saturating_sub(1).max(1));
+    (x.clamp(0.0, 1.0) as f32, (1.0 - down).clamp(0.0, 1.0) as f32)
+}
 
 /// `at` moved `by` within `0..len`.
 fn step(at: usize, by: isize, len: usize) -> usize {

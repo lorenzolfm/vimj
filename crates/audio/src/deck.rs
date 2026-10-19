@@ -1,9 +1,10 @@
-//! One deck: plays a decoded song from a position, time-stretched when its
-//! tempo is changed (the pitch is kept), through its EQ, filter, gain and echo.
+//! One deck: plays a decoded song from a position, through a loop if it has
+//! one, time-stretched when its tempo is changed (the pitch is kept), through
+//! its EQ, filter and gain, with an echo or reverb and a noise sweep on top.
 
-use crate::dsp::{Echo, Eq3, Filter, Smooth};
+use crate::dsp::{ECHO_FEEDBACK, Echo, Eq3, Filter, Noise, Reverb, Smooth};
 use crate::pcm::Pcm;
-use vimj_core::transition::DeckFx;
+use vimj_core::transition::{DeckFx, EffectKind, LoopMap};
 use signalsmith_stretch::Stretch;
 use std::sync::Arc;
 
@@ -11,20 +12,58 @@ use std::sync::Arc;
 const UNSTRETCH_FRAMES: usize = 1_024;
 /// Tempos this close to normal play without the stretcher.
 const TEMPO_EPSILON: f64 = 1e-6;
+/// A loop's jumps back to its start are crossfaded over this long.
+const SEAM_SECONDS: f64 = 0.004;
+
+/// The song as a deck reads it: through the loop, if there is one.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    pcm: &'a Pcm,
+    looping: Option<&'a LoopMap>,
+}
+
+impl Source<'_> {
+    #[inline]
+    fn frame(&self, t: i64) -> [f32; 2] {
+        if self.looping.is_none() { self.pcm.frame(t) } else { self.frame_at(t as f64) }
+    }
+
+    #[inline]
+    fn frame_at(&self, t: f64) -> [f32; 2] {
+        let Some(map) = self.looping else { return self.pcm.frame_at(t) };
+        let (offset, jump) = map.jump(t);
+        let now = self.pcm.frame_at(t + offset);
+        let seam = SEAM_SECONDS * f64::from(self.pcm.rate);
+        match jump {
+            Some((before, since)) if since < seam => {
+                let old = self.pcm.frame_at(t + before);
+                let k = (since / seam) as f32;
+                [old[0] + (now[0] - old[0]) * k, old[1] + (now[1] - old[1]) * k]
+            }
+            _ => now,
+        }
+    }
+}
 
 pub struct Deck {
     pcm: Arc<Pcm>,
-    /// Source frame of the sound coming out now.
+    /// Frame of the song coming out now, on the timeline it would play
+    /// without the loop.
     position: f64,
+    /// Repeats part of the song, in frames.
+    looping: Option<LoopMap>,
     /// Tempo relative to the song's own.
     tempo: f64,
     stretch: Option<Stretcher>,
     /// Frames left in the crossfade back to the plain signal.
     unstretch: usize,
-    speed: Smooth,
     eq: Eq3,
     filter: Filter,
+    /// What the effect send feeds.
+    effect: Option<EffectKind>,
     echo: Echo,
+    reverb: Reverb,
+    noise: Noise,
     gain: Smooth,
     /// Loudness normalisation, linear.
     level: f32,
@@ -40,13 +79,16 @@ impl Deck {
         let mut deck = Deck {
             pcm,
             position,
+            looping: None,
             tempo: 1.0,
             stretch: None,
             unstretch: 0,
-            speed: Smooth::new(1.0, 0.005, rate),
             eq: Eq3::new(rate),
             filter: Filter::new(rate),
+            effect: None,
             echo: Echo::new(rate),
+            reverb: Reverb::new(rate),
+            noise: Noise::new(rate),
             gain: Smooth::new(1.0, 0.004, rate),
             level,
             fx: DeckFx::FLAT,
@@ -57,7 +99,7 @@ impl Deck {
         deck
     }
 
-    /// Source position, in frames.
+    /// Position in frames, on the timeline the song would play without the loop.
     pub fn position(&self) -> f64 {
         self.position
     }
@@ -88,23 +130,44 @@ impl Deck {
         self.tempo = tempo;
         self.unstretch = 0;
         if self.stretch.is_none() {
-            self.stretch = Some(Stretcher::new(&self.pcm, self.position, tempo));
+            let source = Source { pcm: &self.pcm, looping: self.looping.as_ref() };
+            self.stretch = Some(Stretcher::new(source, self.position, tempo));
         }
     }
 
-    pub fn set_echo_delay(&mut self, frames: f64) {
-        self.echo.set_delay(frames.round() as usize);
+    /// Loops part of the song from now on; `map` is in frames.
+    pub fn set_loop(&mut self, map: Option<LoopMap>) {
+        self.looping = map;
+    }
+
+    /// Sets what the effect send feeds; echoes and delays repeat in beats of `beat_frames`.
+    pub fn set_effect(&mut self, effect: Option<EffectKind>, beat_frames: f64) {
+        self.effect = effect;
+        let (beats, feedback) = match effect {
+            Some(EffectKind::Echo { beats }) => (beats, ECHO_FEEDBACK),
+            Some(EffectKind::Delay { beats }) => (beats, 0.0),
+            Some(EffectKind::Reverb) | None => return,
+        };
+        self.echo.set_delay((f64::from(beats) * beat_frames).round() as usize);
+        self.echo.set_feedback(feedback);
     }
 
     /// Silenced and done ringing.
     pub fn silent(&self) -> bool {
-        self.fx.gain == 0.0 && self.gain.value() < 1e-4 && !self.echo.ringing()
+        self.fx.gain == 0.0 && self.gain.value() < 1e-4 && !self.echo.ringing() && !self.reverb.ringing() && !self.noise.sounding()
     }
 
-    /// Fades the deck out; its echo, if any, rings on.
+    /// Fades the deck out; its effect, if any, rings on.
     pub fn retire(&mut self) {
         self.fx.gain = 0.0;
-        self.fx.echo = 0.0;
+        self.fx.send = 0.0;
+        self.fx.noise = 0.0;
+    }
+
+    /// Stops the effect ringing on.
+    pub fn cut_tail(&mut self) {
+        self.echo.cut();
+        self.reverb.cut();
     }
 
     /// Adds `out.len() / 2` frames of this deck to `out` (interleaved stereo).
@@ -112,35 +175,39 @@ impl Deck {
         let n = out.len() / 2;
         self.source(n);
         let fx = self.fx;
+        let (echo, reverb) = match self.effect {
+            Some(EffectKind::Reverb) => (0.0, fx.send),
+            Some(_) => (fx.send, 0.0),
+            None => (0.0, 0.0),
+        };
         for (i, frame) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let x = [self.scratch[i * 2] * self.level, self.scratch[i * 2 + 1] * self.level];
             let shaped = self.filter.process(self.eq.process(x, fx.eq), fx.filter);
             let gain = self.gain.next(fx.gain);
             let dry = [shaped[0] * gain, shaped[1] * gain];
-            let y = self.echo.process(dry, shaped, fx.echo);
-            frame[0] += y[0];
-            frame[1] += y[1];
+            // Sends take the song before its fader, so an effect can carry it out.
+            let y = self.echo.process(dry, shaped, echo);
+            let y = self.reverb.process(y, shaped, reverb);
+            let noise = self.noise.process(fx.noise);
+            frame[0] += y[0] + noise[0];
+            frame[1] += y[1] + noise[1];
         }
     }
 
     /// Fills `scratch` with the next `n` frames of the song itself.
     fn source(&mut self, n: usize) {
         self.scratch.resize(n * 2, 0.0);
+        let source = Source { pcm: &self.pcm, looping: self.looping.as_ref() };
         let Some(stretch) = self.stretch.as_mut() else {
             for i in 0..n {
-                let speed = self.speed.next(self.fx.speed.clamp(0.0, 1.0));
-                let f = if speed == 1.0 && self.position.fract() == 0.0 {
-                    self.pcm.frame(self.position as i64)
-                } else {
-                    self.pcm.frame_at(self.position)
-                };
+                let f = if self.position.fract() == 0.0 { source.frame(self.position as i64) } else { source.frame_at(self.position) };
                 self.scratch[i * 2] = f[0];
                 self.scratch[i * 2 + 1] = f[1];
-                self.position += f64::from(speed);
+                self.position += 1.0;
             }
             return;
         };
-        stretch.render(&self.pcm, self.tempo, n, &mut self.scratch);
+        stretch.render(source, self.tempo, n, &mut self.scratch);
         if self.unstretch == 0 {
             self.position += n as f64 * self.tempo;
             return;
@@ -148,7 +215,7 @@ impl Deck {
         // Blend into the plain signal, which is time-aligned with the stretched one.
         self.plain.clear();
         for i in 0..n {
-            self.plain.extend(self.pcm.frame(self.position as i64 + i as i64));
+            self.plain.extend(source.frame(self.position as i64 + i as i64));
         }
         for i in 0..n {
             let t = (UNSTRETCH_FRAMES - self.unstretch.saturating_sub(i)) as f32 / UNSTRETCH_FRAMES as f32;
@@ -176,8 +243,8 @@ struct Stretcher {
 }
 
 impl Stretcher {
-    fn new(pcm: &Pcm, position: f64, tempo: f64) -> Stretcher {
-        let mut inner = Stretch::preset_default(2, pcm.rate);
+    fn new(source: Source, position: f64, tempo: f64) -> Stretcher {
+        let mut inner = Stretch::preset_default(2, source.pcm.rate);
         let input_latency = inner.input_latency();
         // After seeking, the stretcher is `input_latency` behind its input and
         // its output trails by `output_latency` more, so feed that far ahead.
@@ -185,19 +252,19 @@ impl Stretcher {
         let preroll = 4 * input_latency as i64;
         let mut input = Vec::with_capacity(preroll as usize * 2);
         for f in feed - preroll..feed {
-            input.extend(pcm.frame(f));
+            input.extend(source.frame(f));
         }
         inner.seek(&input, tempo);
         Stretcher { inner, feed, carry: 0.0, input }
     }
 
-    fn render(&mut self, pcm: &Pcm, tempo: f64, n: usize, out: &mut [f32]) {
+    fn render(&mut self, source: Source, tempo: f64, n: usize, out: &mut [f32]) {
         let exact = self.carry + n as f64 * tempo;
         let take = exact.floor() as usize;
         self.carry = exact - take as f64;
         self.input.clear();
         for f in self.feed..self.feed + take as i64 {
-            self.input.extend(pcm.frame(f));
+            self.input.extend(source.frame(f));
         }
         self.feed += take as i64;
         self.inner.process(&self.input, &mut out[..n * 2]);
@@ -290,13 +357,30 @@ mod tests {
     }
 
     #[test]
-    fn brake_slows_to_a_stop() {
+    fn loops_replay_part_of_the_song() {
         let mut deck = Deck::new(clicks(24_000, 10), 0.0, 1.0, 1.0);
-        deck.fx.speed = 0.0;
-        render(&mut deck, 48_000);
-        let stopped = deck.position();
-        render(&mut deck, 48_000);
-        assert!(stopped < 1_000.0 && deck.position() - stopped < 1.0);
+        // From 12 000, replay 18 000 frames, which hold the click at 24 000.
+        let stage = vimj_core::transition::Stage { from: 12_000.0, to: 1e9, period: 18_000.0 };
+        deck.set_loop(Some(LoopMap { start: 12_000.0, stages: vec![stage] }));
+        let got = onsets(&render(&mut deck, 90_000));
+        assert_eq!(got, vec![4, 24_004, 42_004, 60_004, 78_004]);
+        assert_eq!(deck.position(), 90_000.0, "the position runs on as if unlooped");
+    }
+
+    #[test]
+    fn effects_ring_on_until_cut() {
+        for effect in [EffectKind::Reverb, EffectKind::Echo { beats: 0.5 }] {
+            let mut deck = Deck::new(clicks(4_800, 100), 0.0, 1.0, 1.0);
+            deck.set_effect(Some(effect), 12_000.0);
+            deck.fx.send = 1.0;
+            render(&mut deck, 24_000);
+            deck.retire();
+            render(&mut deck, 4_800);
+            assert!(!deck.silent(), "{effect:?} rings on");
+            deck.cut_tail();
+            render(&mut deck, 4_800);
+            assert!(deck.silent(), "{effect:?} cut");
+        }
     }
 
     #[test]

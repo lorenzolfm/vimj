@@ -36,7 +36,7 @@ impl App {
     pub fn new(paths: Paths, output: Output) -> Result<Arc<App>> {
         let config = Config::load(&paths.config)?;
         let music_dir = config.music_dir(&paths);
-        let lib = Library::load(paths.library.clone());
+        let lib = Library::load(paths.library.clone())?;
         let (events, _) = broadcast::channel(256);
         let (changed, mut changes) = tokio::sync::mpsc::unbounded_channel();
         let playback = Playback::new(output, config.ffmpeg(), config.volume.unwrap_or(80), changed);
