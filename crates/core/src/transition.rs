@@ -9,7 +9,7 @@
 //! so their beats stay locked, then eases back to its own tempo.
 
 use crate::compat::Compat;
-use crate::curve::{self, Point, line, p};
+use crate::curve::{self, Curve, Point, line, p};
 use crate::model::{Analysis, BEATS_PER_BAR, Grid};
 use serde::{Deserialize, Serialize};
 
@@ -36,8 +36,6 @@ pub enum Preset {
     Dissolve,
     Surge,
     Afterglow,
-    /// Styles or curves picked by hand.
-    Custom,
 }
 
 /// One style per ingredient.
@@ -74,7 +72,6 @@ impl Preset {
             Preset::Dissolve => "Dissolve",
             Preset::Surge => "Surge",
             Preset::Afterglow => "Afterglow",
-            Preset::Custom => "Custom",
         }
     }
 
@@ -89,12 +86,11 @@ impl Preset {
             Preset::Dissolve => "Crossfade, low-pass out into a reverb that rings on",
             Preset::Surge => "A one-bar loop and a noise sweep build up, then cut",
             Preset::Afterglow => "Smooth crossfade, high-pass out, an echo that rings on",
-            Preset::Custom => "Your own styles and curves",
         }
     }
 
-    pub fn styles(self) -> Option<Styles> {
-        let styles = |volume, eq, filter, effect, looping| Some(Styles { volume, eq, filter, effect, looping });
+    pub fn styles(self) -> Styles {
+        let styles = |volume, eq, filter, effect, looping| Styles { volume, eq, filter, effect, looping };
         match self {
             Preset::Fade => styles(Volume::Smooth, Eq::CenterBass, Filter::None, Effect::None, Looping::None),
             Preset::Rise => styles(Volume::Overlap, Eq::EndBass, Filter::LowPassInHighPassOut, Effect::None, Looping::None),
@@ -105,7 +101,6 @@ impl Preset {
             Preset::Dissolve => styles(Volume::Crossfade, Eq::CenterBass, Filter::LowPassOut, Effect::ReverbOutEnd, Looping::None),
             Preset::Surge => styles(Volume::FadeInCutOut, Eq::EndBass, Filter::NoiseOutEnd, Effect::None, Looping::FourBeat),
             Preset::Afterglow => styles(Volume::Smooth, Eq::CenterBass, Filter::HighPassOut, Effect::EchoThreeQuarterOutEnd, Looping::None),
-            Preset::Custom => None,
         }
     }
 }
@@ -595,48 +590,57 @@ impl LoopMap {
     }
 }
 
-/// Curves drawn by hand, each in place of its style's for one song.
+/// Curves drawn by hand, each in place of its style's for one song. Effects
+/// only ever go on the outgoing song, so that lane has its one curve.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Curves {
     #[serde(default, skip_serializing_if = "unset")]
-    pub volume: [Option<Vec<Point>>; 2],
+    volume: [Option<Curve>; 2],
     #[serde(default, skip_serializing_if = "unset")]
-    pub eq: [Option<Vec<Point>>; 2],
+    eq: [Option<Curve>; 2],
     #[serde(default, skip_serializing_if = "unset")]
-    pub filter: [Option<Vec<Point>>; 2],
-    #[serde(default, skip_serializing_if = "unset")]
-    pub effect: [Option<Vec<Point>>; 2],
+    filter: [Option<Curve>; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect: Option<Curve>,
 }
 
-fn unset(pair: &[Option<Vec<Point>>; 2]) -> bool {
+fn unset(pair: &[Option<Curve>; 2]) -> bool {
     pair.iter().all(Option::is_none)
 }
 
 impl Curves {
     pub fn is_empty(&self) -> bool {
-        Lane::ALL.into_iter().all(|lane| unset(self.lane(lane)))
+        unset(&self.volume) && unset(&self.eq) && unset(&self.filter) && self.effect.is_none()
     }
 
-    fn lane(&self, lane: Lane) -> &[Option<Vec<Point>>; 2] {
+    /// Where a lane's curve for one song goes: nowhere for effects on the incoming song.
+    fn slot_mut(&mut self, lane: Lane, track: Track) -> Option<&mut Option<Curve>> {
+        let i = track.index();
         match lane {
-            Lane::Volume => &self.volume,
-            Lane::Eq => &self.eq,
-            Lane::Filter => &self.filter,
-            Lane::Effect => &self.effect,
+            Lane::Volume => Some(&mut self.volume[i]),
+            Lane::Eq => Some(&mut self.eq[i]),
+            Lane::Filter => Some(&mut self.filter[i]),
+            Lane::Effect => (track == Track::Out).then_some(&mut self.effect),
         }
     }
 
-    fn lane_mut(&mut self, lane: Lane) -> &mut [Option<Vec<Point>>; 2] {
+    fn clear(&mut self, lane: Lane) {
         match lane {
-            Lane::Volume => &mut self.volume,
-            Lane::Eq => &mut self.eq,
-            Lane::Filter => &mut self.filter,
-            Lane::Effect => &mut self.effect,
+            Lane::Volume => self.volume = [None, None],
+            Lane::Eq => self.eq = [None, None],
+            Lane::Filter => self.filter = [None, None],
+            Lane::Effect => self.effect = None,
         }
     }
 
     pub fn get(&self, lane: Lane, track: Track) -> Option<&[Point]> {
-        self.lane(lane)[track.index()].as_deref()
+        let i = track.index();
+        match lane {
+            Lane::Volume => self.volume[i].as_deref(),
+            Lane::Eq => self.eq[i].as_deref(),
+            Lane::Filter => self.filter[i].as_deref(),
+            Lane::Effect => self.effect.as_deref().filter(|_| track == Track::Out),
+        }
     }
 }
 
@@ -666,15 +670,13 @@ pub struct Moment {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(from = "Stored")]
+#[serde(try_from = "Stored", into = "Stored")]
 pub struct Transition {
-    pub preset: Preset,
     pub volume: Volume,
     pub eq: Eq,
     pub filter: Filter,
     pub effect: Effect,
     pub looping: Looping,
-    #[serde(default, skip_serializing_if = "Curves::is_empty")]
     pub curves: Curves,
     /// Length in bars of the outgoing song.
     pub bars: u32,
@@ -693,61 +695,45 @@ impl Transition {
         Styles { volume: self.volume, eq: self.eq, filter: self.filter, effect: self.effect, looping: self.looping }
     }
 
+    /// The preset this is, or `None` for one of your own: styles no preset
+    /// combines, or curves drawn by hand.
+    pub fn preset(&self) -> Option<Preset> {
+        let styles = self.styles();
+        Preset::ALL.into_iter().find(|p| p.styles() == styles).filter(|_| self.curves.is_empty())
+    }
+
+    /// The preset's name, or "Custom".
+    pub fn preset_label(&self) -> &'static str {
+        self.preset().map_or("Custom", Preset::label)
+    }
+
     /// Takes on a preset's styles, dropping curves drawn by hand.
     pub fn set_preset(&mut self, preset: Preset) {
-        self.preset = preset;
-        if let Some(s) = preset.styles() {
-            (self.volume, self.eq, self.filter, self.effect, self.looping) = (s.volume, s.eq, s.filter, s.effect, s.looping);
-            self.curves = Curves::default();
-        }
+        let s = preset.styles();
+        (self.volume, self.eq, self.filter, self.effect, self.looping) = (s.volume, s.eq, s.filter, s.effect, s.looping);
+        self.curves = Curves::default();
     }
+
+    // A new style replaces the curves drawn over the old one.
 
     pub fn set_volume(&mut self, volume: Volume) {
         self.volume = volume;
-        self.restyled(Lane::Volume);
+        self.curves.clear(Lane::Volume);
     }
 
     pub fn set_eq(&mut self, eq: Eq) {
         self.eq = eq;
-        self.restyled(Lane::Eq);
+        self.curves.clear(Lane::Eq);
     }
 
     pub fn set_filter(&mut self, filter: Filter) {
         self.filter = filter;
-        self.restyled(Lane::Filter);
+        self.curves.clear(Lane::Filter);
     }
 
     pub fn set_effect(&mut self, effect: Effect) {
         self.effect = effect;
-        self.restyled(Lane::Effect);
-    }
-
-    pub fn set_looping(&mut self, looping: Looping) {
-        self.looping = looping;
-        self.customize();
-    }
-
-    /// A new style replaces the curves drawn over the old one.
-    fn restyled(&mut self, lane: Lane) {
-        *self.curves.lane_mut(lane) = [None, None];
-        self.customize();
-    }
-
-    /// Records that something was changed by hand.
-    pub fn customize(&mut self) {
-        // A curve drawn back to its style's shape is the style again.
-        for lane in Lane::ALL {
-            for track in [Track::Out, Track::In] {
-                let style = self.style_curve(lane, track);
-                let slot = &mut self.curves.lane_mut(lane)[track.index()];
-                if slot.is_some() && (style.is_none() || slot.as_deref() == style) {
-                    *slot = None;
-                }
-            }
-        }
-        if Some(self.styles()) != self.preset.styles() || !self.curves.is_empty() {
-            self.preset = Preset::Custom;
-        }
+        self.curves.clear(Lane::Effect);
     }
 
     /// The curve a lane follows for one song: drawn by hand or its style's.
@@ -767,17 +753,25 @@ impl Transition {
         }
     }
 
-    /// The curve to redraw for a lane and song, starting from the style's.
-    /// `None` where the style leaves that song alone.
-    pub fn curve_mut(&mut self, lane: Lane, track: Track) -> Option<&mut Vec<Point>> {
+    /// Redraws a lane's curve for one song with `f`, starting from the
+    /// style's, and returns what `f` does; `None` where the style leaves that
+    /// song alone. A curve drawn back to the style's shape is the style again.
+    pub fn redraw<R>(&mut self, lane: Lane, track: Track, f: impl FnOnce(&mut Curve) -> R) -> Option<R> {
         let style = self.style_curve(lane, track)?;
-        let slot = &mut self.curves.lane_mut(lane)[track.index()];
-        Some(slot.get_or_insert_with(|| style.to_vec()))
+        let slot = self.curves.slot_mut(lane, track)?;
+        let curve = slot.get_or_insert_with(|| Curve::try_from(style.to_vec()).expect("styles draw whole curves"));
+        let done = f(curve);
+        if **curve == *style {
+            *slot = None;
+        }
+        Some(done)
     }
 
     /// Goes back to the style's curve for a lane and song.
     pub fn reset_curve(&mut self, lane: Lane, track: Track) {
-        self.curves.lane_mut(lane)[track.index()] = None;
+        if let Some(slot) = self.curves.slot_mut(lane, track) {
+            *slot = None;
+        }
     }
 
     /// Whether a lane's curve for a song was drawn by hand.
@@ -859,11 +853,15 @@ impl Transition {
     }
 }
 
-/// A transition as stored, which may be from before filter, effects and
-/// looping were separate: `effect` then held a filter sweep, an echo or a brake.
-#[derive(Deserialize)]
+/// A transition as stored and sent. Stored ones may be from before filter,
+/// effects and looping were separate: `effect` then held a filter sweep, an
+/// echo or a brake.
+#[derive(Serialize, Deserialize)]
 struct Stored {
-    preset: Preset,
+    /// The preset the styles make, for frontends. Worked out again on
+    /// reading, so a transition keeps its sound when a preset's recipe changes.
+    #[serde(skip_deserializing)]
+    preset: Option<Preset>,
     volume: Volume,
     eq: Eq,
     #[serde(default)]
@@ -871,7 +869,7 @@ struct Stored {
     effect: StoredEffect,
     #[serde(default)]
     looping: Looping,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Curves::is_empty")]
     curves: Curves,
     bars: u32,
     out_ms: f64,
@@ -880,14 +878,14 @@ struct Stored {
     auto: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum StoredEffect {
     Current(Effect),
     Old(OldEffect),
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OldEffect {
     HighPassOut,
@@ -900,8 +898,15 @@ enum OldEffect {
     Brake,
 }
 
-impl From<Stored> for Transition {
-    fn from(s: Stored) -> Transition {
+/// Checks what the types can't: the length, and that curves drawn by hand
+/// are where a style draws one.
+impl TryFrom<Stored> for Transition {
+    type Error = String;
+
+    fn try_from(s: Stored) -> Result<Transition, String> {
+        if !BAR_CHOICES.contains(&s.bars) {
+            return Err(format!("a transition lasts 1, 2, 4, 8 or 16 bars, not {}", s.bars));
+        }
         let (filter, effect) = match s.effect {
             StoredEffect::Current(effect) => (s.filter.unwrap_or(Filter::None), effect),
             StoredEffect::Old(old) => match old {
@@ -916,7 +921,6 @@ impl From<Stored> for Transition {
             },
         };
         let mut t = Transition {
-            preset: s.preset,
             volume: s.volume,
             eq: s.eq,
             filter,
@@ -929,9 +933,41 @@ impl From<Stored> for Transition {
             sync: s.sync,
             auto: s.auto,
         };
-        // Presets whose recipe changed keep the sound they were saved with.
-        t.customize();
-        t
+        for lane in Lane::ALL {
+            for track in [Track::Out, Track::In] {
+                let style = t.style_curve(lane, track);
+                let Some(slot) = t.curves.slot_mut(lane, track) else { continue };
+                match (slot.as_deref(), style) {
+                    (Some(_), None) => {
+                        let song = if track == Track::Out { "outgoing" } else { "incoming" };
+                        return Err(format!("{} drawn by hand on the {song} song, whose style draws none", lane.label()));
+                    }
+                    // A curve drawn to the style's shape is the style.
+                    (Some(drawn), Some(style)) if drawn == style => *slot = None,
+                    _ => {}
+                }
+            }
+        }
+        Ok(t)
+    }
+}
+
+impl From<Transition> for Stored {
+    fn from(t: Transition) -> Stored {
+        Stored {
+            preset: t.preset(),
+            volume: t.volume,
+            eq: t.eq,
+            filter: Some(t.filter),
+            effect: StoredEffect::Current(t.effect),
+            looping: t.looping,
+            curves: t.curves,
+            bars: t.bars,
+            out_ms: t.out_ms,
+            in_ms: t.in_ms,
+            sync: t.sync,
+            auto: t.auto,
+        }
     }
 }
 
@@ -987,7 +1023,6 @@ pub fn auto_transition(from: Side, to: Side, compat: &Compat) -> Transition {
     let synced = matches!((a, b), (Some(a), Some(b)) if sync_rate(a.bpm, b.bpm).is_some());
     let (preset, bars) = auto_preset(a.is_some() && b.is_some(), synced, compat);
     let mut t = Transition {
-        preset,
         volume: Volume::Smooth,
         eq: Eq::Off,
         filter: Filter::None,
@@ -1052,7 +1087,6 @@ mod tests {
 
     fn transition(preset: Preset) -> Transition {
         let mut t = Transition {
-            preset,
             volume: Volume::Smooth,
             eq: Eq::Off,
             filter: Filter::None,
@@ -1101,6 +1135,12 @@ mod tests {
             assert_eq!(end.inc.eq, [1.0; 3], "{what:?} leaves the incoming EQ flat");
             assert!(end.inc.filter.abs() < 1e-6 && end.inc.noise == 0.0, "{what:?} leaves the incoming filter open");
             assert_eq!((start.out.filter, start.inc.send, end.inc.send), (0.0, 0.0, 0.0), "{what:?}");
+            // Redrawing starts from these.
+            for (lane, track) in Lane::ALL.into_iter().flat_map(|lane| [(lane, Track::Out), (lane, Track::In)]) {
+                if let Some(c) = t.curve(lane, track) {
+                    assert!(Curve::try_from(c.to_vec()).is_ok(), "{what:?}: {lane:?} on {track:?}");
+                }
+            }
             for i in 0..=20 {
                 let m = t.at(i as f32 / 20.0);
                 for fx in [m.out, m.inc] {
@@ -1173,27 +1213,29 @@ mod tests {
     }
 
     #[test]
-    fn editing_makes_it_custom_until_a_preset_is_picked() {
+    fn the_preset_is_the_one_whose_styles_it_has() {
         let mut t = transition(Preset::Blend);
         t.set_effect(Effect::EchoHalfOutEnd);
-        assert_eq!(t.preset, Preset::Custom);
+        assert_eq!(t.preset(), None);
         t.set_preset(Preset::Rise);
-        assert_eq!(t.styles(), Preset::Rise.styles().unwrap());
-        t.customize();
-        assert_eq!(t.preset, Preset::Rise);
-        t.set_looping(Looping::TwoBeat);
-        assert_eq!(t.preset, Preset::Custom);
+        assert_eq!(t.styles(), Preset::Rise.styles());
+        assert_eq!(t.preset(), Some(Preset::Rise));
+        t.looping = Looping::TwoBeat;
+        assert_eq!(t.preset(), None);
+        t.looping = Looping::None;
+        assert_eq!(t.preset(), Some(Preset::Rise), "back to Rise's styles");
     }
 
     #[test]
     fn drawn_curves_replace_the_style_until_it_changes() {
         let mut t = transition(Preset::Fade);
-        assert_eq!(t.curve_mut(Lane::Filter, Track::Out), None, "Fade has no filter");
-        let points = t.curve_mut(Lane::Volume, Track::Out).unwrap();
-        assert_eq!(points.len(), 3, "starts from the style's curve");
-        *points = vec![p(0.0, 1.0), p(0.5, 0.0), p(1.0, 0.0)];
-        t.customize();
-        assert_eq!(t.preset, Preset::Custom);
+        assert_eq!(t.redraw(Lane::Filter, Track::Out, |_| ()), None, "Fade has no filter");
+        let len = t.redraw(Lane::Volume, Track::Out, |c| {
+            c.move_point(1, 0.5, 0.0);
+            c.len()
+        });
+        assert_eq!(len, Some(3), "starts from the style's curve");
+        assert_eq!(t.preset(), None);
         assert!(t.is_custom(Lane::Volume, Track::Out) && !t.is_custom(Lane::Volume, Track::In));
         assert!(t.at(0.5).out.gain.abs() < 1e-6);
         // The incoming song's curve is untouched.
@@ -1202,8 +1244,11 @@ mod tests {
         assert!(!t.is_custom(Lane::Volume, Track::Out));
         assert!(t.curves.is_empty());
 
-        let points = t.curve_mut(Lane::Eq, Track::In).unwrap();
-        points[0].y = 1.0;
+        t.redraw(Lane::Eq, Track::In, |c| c.move_point(0, 0.0, 1.0));
+        assert!(!t.curves.is_empty());
+        t.redraw(Lane::Eq, Track::In, |c| c.move_point(0, 0.0, 0.0));
+        assert!(t.curves.is_empty(), "drawn back to the style's shape");
+        t.redraw(Lane::Eq, Track::In, |c| c.move_point(0, 0.0, 1.0));
         t.reset_curve(Lane::Eq, Track::In);
         assert!(t.curves.is_empty());
     }
@@ -1211,12 +1256,34 @@ mod tests {
     #[test]
     fn stores_and_reads_back_drawn_curves() {
         let mut t = transition(Preset::Surge);
-        t.curve_mut(Lane::Filter, Track::Out).unwrap()[1].y = 0.3;
-        t.customize();
+        t.redraw(Lane::Filter, Track::Out, |c| c.move_point(1, c[1].x, 0.3));
         let json = serde_json::to_string(&t).unwrap();
         assert_eq!(serde_json::from_str::<Transition>(&json).unwrap(), t);
         let plain = serde_json::to_string(&transition(Preset::Fade)).unwrap();
         assert!(!plain.contains("curves"), "{plain}");
+        // Frontends are told the preset, which reading works out again.
+        let preset = |t: &Transition| serde_json::to_value(t).unwrap()["preset"].clone();
+        assert_eq!(preset(&transition(Preset::Fade)), "fade");
+        assert_eq!(preset(&t), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn reads_only_transitions_that_can_play() {
+        let read = |bars: u32, curves: &str| {
+            let json = format!(
+                r#"{{"volume":"smooth","eq":"center_bass","filter":"high_pass_out","effect":"none","curves":{curves},"bars":{bars},"out_ms":0,"in_ms":0,"sync":true,"auto":false}}"#
+            );
+            serde_json::from_str::<Transition>(&json)
+        };
+        let ramp = r#"[{"x":0,"y":0},{"x":1,"y":0.5}]"#;
+        assert!(read(8, "{}").is_ok());
+        assert!(read(0, "{}").is_err() && read(3, "{}").is_err(), "lengths not offered");
+        assert!(read(8, &format!(r#"{{"filter":[{ramp},null]}}"#)).is_ok(), "A has a filter to redraw");
+        assert!(read(8, &format!(r#"{{"filter":[null,{ramp}]}}"#)).is_err(), "B has none");
+        assert!(read(8, r#"{"volume":[[{"x":0,"y":5},{"x":1,"y":0}],null]}"#).is_err(), "a curve that isn't one");
+        // Center bass swap's own curve for A, drawn by hand.
+        let center = r#"[{"x":0,"y":1},{"x":0.485,"y":1},{"x":0.515,"y":0},{"x":1,"y":0}]"#;
+        assert!(read(8, &format!(r#"{{"eq":[{center},null]}}"#)).unwrap().curves.is_empty(), "is the style");
     }
 
     #[test]
@@ -1228,12 +1295,12 @@ mod tests {
             serde_json::from_str::<Transition>(&json).unwrap()
         };
         let rise = old("rise", "filter_swap");
-        assert_eq!((rise.preset, rise.filter, rise.effect, rise.looping), (Preset::Rise, Filter::LowPassInHighPassOut, Effect::None, Looping::None));
+        assert_eq!((rise.preset(), rise.filter, rise.effect, rise.looping), (Some(Preset::Rise), Filter::LowPassInHighPassOut, Effect::None, Looping::None));
         let echo = old("custom", "filter_echo");
         assert_eq!((echo.filter, echo.effect), (Filter::HighPassOut, Effect::EchoThreeQuarterOutEnd));
         assert_eq!(old("custom", "brake").effect, Effect::None);
         // Rise's recipe has no echo, so an old Rise with one is now Custom.
-        assert_eq!(old("rise", "echo").preset, Preset::Custom);
+        assert_eq!(old("rise", "echo").preset(), None);
         assert_eq!(old("rise", "none").filter, Filter::None);
     }
 
@@ -1243,7 +1310,7 @@ mod tests {
         t.out_ms = 10_000.0;
         let g = Grid { bpm: 120.0, downbeat_ms: 0.0 };
         assert_eq!(t.loop_map(Some(&g)), None);
-        t.set_looping(Looping::FourBeat);
+        t.looping = Looping::FourBeat;
         let map = t.loop_map(Some(&g)).unwrap();
         // 4 beats at 120 BPM: two seconds, replayed through the 16 s window.
         assert_eq!(map.offset(9_000.0), 0.0);
@@ -1264,7 +1331,7 @@ mod tests {
         assert_eq!((blocks[0].start, blocks[3].end), (0.0, 1.0));
         assert!(blocks.windows(2).all(|w| w[0].end == w[1].start));
         let mut t = transition(Preset::Fade);
-        t.set_looping(Looping::Halving);
+        t.looping = Looping::Halving;
         let map = t.loop_map(Some(&Grid { bpm: 120.0, downbeat_ms: 0.0 })).unwrap();
         // The second stage starts at 8 s and replays from the window's start every second.
         assert_eq!(map.offset(8_500.0), -8_000.0);
@@ -1310,7 +1377,7 @@ mod tests {
         let to = Side { duration_ms: 180_000.0, analysis: Some(&fb) };
         let t = auto_transition(from, to, &c);
         assert!(t.auto && t.sync);
-        assert_eq!(t.preset, Preset::Blend);
+        assert_eq!(t.preset(), Some(Preset::Blend));
         let ga = fa.grid.unwrap();
         let gb = fb.grid.unwrap();
         // Out: on a phrase (32 beats) and the window ends before the music does.
@@ -1332,7 +1399,7 @@ mod tests {
         assert!(!t.sync);
         assert_eq!(t.bars, 2);
         let none = auto_transition(Side { duration_ms: 200_000.0, analysis: None }, side(&fb), &c);
-        assert_eq!((none.preset, none.bars, none.sync), (Preset::Fade, 4, false));
+        assert_eq!((none.preset(), none.bars, none.sync), (Some(Preset::Fade), 4, false));
         assert_eq!(none.out_ms, 200_000.0 - 8_000.0);
     }
 
@@ -1341,11 +1408,11 @@ mod tests {
         let pick = |a: Analysis, b: Analysis| {
             let c = compat(Some(&a), Some(&b));
             let side = |f| Side { duration_ms: 200_000.0, analysis: Some(f) };
-            auto_transition(side(&a), side(&b), &c).preset
+            auto_transition(side(&a), side(&b), &c).preset()
         };
-        assert_eq!(pick(feat(124.0, 9, 0, 0.4), feat(125.0, 9, 0, 0.7)), Preset::Rise);
-        assert_eq!(pick(feat(124.0, 9, 0, 0.8), feat(125.0, 9, 0, 0.4)), Preset::Melt);
-        assert_eq!(pick(feat(124.0, 9, 0, 0.6), feat(125.0, 3, 0, 0.6)), Preset::Wave);
+        assert_eq!(pick(feat(124.0, 9, 0, 0.4), feat(125.0, 9, 0, 0.7)), Some(Preset::Rise));
+        assert_eq!(pick(feat(124.0, 9, 0, 0.8), feat(125.0, 9, 0, 0.4)), Some(Preset::Melt));
+        assert_eq!(pick(feat(124.0, 9, 0, 0.6), feat(125.0, 3, 0, 0.6)), Some(Preset::Wave));
     }
 
     #[test]

@@ -638,7 +638,6 @@ mod tests {
 
     fn blend(out_ms: f64, in_ms: f64, bars: u32) -> Transition {
         let mut t = Transition {
-            preset: Preset::Blend,
             volume: Volume::Smooth,
             eq: Eq::Off,
             filter: Filter::None,
@@ -887,7 +886,7 @@ mod tests {
         // A leaves at bar 10 (20 s, 2 000 Hz) over 4 bars, looping its first.
         let mut t = blend(20_000.0, 0.0, 4);
         t.set_volume(Volume::FadeInCutOut);
-        t.set_looping(Looping::FourBeat);
+        t.looping = Looping::FourBeat;
         let plan = Plan { entries: vec![entry("a", 120.0, Some(t)), entry("b", 120.0, None)], preview: None };
         let mut e = engine(plan, &[("a", a), ("b", b)]);
         e.command(Command::Play { index: 0, position_ms: 10_000.0 });

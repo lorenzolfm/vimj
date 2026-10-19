@@ -99,14 +99,15 @@ impl Config {
     }
 }
 
-pub fn load_json<T: DeserializeOwned + Default>(path: &Path) -> T {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("ignoring unreadable {}: {e}", path.display());
-            T::default()
-        }),
-        Err(_) => T::default(),
-    }
+/// `None` when there is no file yet. A file that is there but can't be read
+/// is an error rather than an empty value, which would be saved over it.
+pub fn load_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_slice(&bytes).map(Some).with_context(|| format!("reading {}", path.display()))
 }
 
 pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {

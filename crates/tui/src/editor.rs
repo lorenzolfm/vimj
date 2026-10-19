@@ -9,7 +9,7 @@ use crate::mouse::{self, Hits, Target};
 use crate::theme::{self, *};
 use crate::wave;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use vimj_core::curve::{self, Point};
+use vimj_core::curve::{self, Curve, Point};
 use vimj_core::model::{BEATS_PER_BAR, Grid};
 use vimj_core::protocol::{PlayerState, SongInfo, TransitionDetail};
 use vimj_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Filter, FilterKind, Lane, Looping, Preset, Side, Track, Transition, Volume};
@@ -87,6 +87,14 @@ pub struct Drawing {
     pub point: usize,
 }
 
+/// What the keys work on: a field, or a curve being drawn by hand, whose
+/// lane's field is then the one picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    Fields(Field),
+    Drawing(Drawing),
+}
+
 pub struct Editor {
     /// The pair is `songs[index]` → `songs[index + 1]`.
     pub index: usize,
@@ -97,9 +105,7 @@ pub struct Editor {
     pub detail: Option<TransitionDetail>,
     /// The transition being edited, which `:w` stores.
     pub draft: Option<Transition>,
-    pub field: Field,
-    /// Drawing a curve by hand, instead of picking fields.
-    pub drawing: Option<Drawing>,
+    mode: Mode,
     /// Drafts before each edit, and those `u` stepped back over.
     undo: Vec<Transition>,
     redo: Vec<Transition>,
@@ -131,14 +137,36 @@ impl Editor {
             to,
             detail: None,
             draft: None,
-            field: Field::Preset,
-            drawing: None,
+            mode: Mode::Fields(Field::Preset),
             undo: Vec::new(),
             redo: Vec::new(),
             dragged: false,
             changed_at: None,
             restart_preview: false,
             previewing: false,
+        }
+    }
+
+    /// The field picked; while drawing, the one whose curve it is.
+    pub fn field(&self) -> Field {
+        match self.mode {
+            Mode::Fields(f) => f,
+            Mode::Drawing(d) => Field::of(d.lane),
+        }
+    }
+
+    /// Picks a field. A curve being drawn keeps its own.
+    pub fn pick_field(&mut self, field: Field) {
+        if let Mode::Fields(f) = &mut self.mode {
+            *f = field;
+        }
+    }
+
+    /// The curve being drawn by hand, if one is.
+    pub fn drawing(&self) -> Option<Drawing> {
+        match self.mode {
+            Mode::Drawing(d) => Some(d),
+            Mode::Fields(_) => None,
         }
     }
 
@@ -262,7 +290,7 @@ impl Editor {
             KeyCode::Char(' ') => return Action::TogglePreview,
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('r') if ctrl => self.redo(),
-            _ if self.drawing.is_some() => self.drawing_key(key),
+            _ if self.drawing().is_some() => self.drawing_key(key),
             _ => return self.field_key(key),
         }
         Action::None
@@ -278,18 +306,18 @@ impl Editor {
             KeyCode::Char('R') | KeyCode::Char('0') => self.reset(),
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => self.step_field(1),
             KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => self.step_field(-1),
-            KeyCode::Char('g') => self.field = FIELDS[0],
-            KeyCode::Char('G') => self.field = FIELDS[FIELDS.len() - 1],
+            KeyCode::Char('g') => self.pick_field(FIELDS[0]),
+            KeyCode::Char('G') => self.pick_field(FIELDS[FIELDS.len() - 1]),
             KeyCode::Char(c @ '1'..='9') => self.preset(Preset::ALL[c as usize - '1' as usize]),
             KeyCode::Char('s') => self.edit(true, |t| t.sync = !t.sync),
             KeyCode::Char('+') | KeyCode::Char('=') => self.change(Field::Length, 1, false),
             KeyCode::Char('-') => self.change(Field::Length, -1, false),
-            KeyCode::Char('h') | KeyCode::Left => self.change(self.field, -1, shift),
-            KeyCode::Char('l') | KeyCode::Right => self.change(self.field, 1, shift),
-            KeyCode::Char('H') => self.change(self.field, -1, true),
-            KeyCode::Char('L') => self.change(self.field, 1, true),
-            KeyCode::Char('b') => self.change(self.field, -(PHRASE_STEPS as i32), true),
-            KeyCode::Char('w') => self.change(self.field, PHRASE_STEPS as i32, true),
+            KeyCode::Char('h') | KeyCode::Left => self.change(self.field(), -1, shift),
+            KeyCode::Char('l') | KeyCode::Right => self.change(self.field(), 1, shift),
+            KeyCode::Char('H') => self.change(self.field(), -1, true),
+            KeyCode::Char('L') => self.change(self.field(), 1, true),
+            KeyCode::Char('b') => self.change(self.field(), -(PHRASE_STEPS as i32), true),
+            KeyCode::Char('w') => self.change(self.field(), PHRASE_STEPS as i32, true),
             KeyCode::Char(',') => self.nudge(-NUDGE_MS),
             KeyCode::Char('.') => self.nudge(NUDGE_MS),
             _ => {}
@@ -300,7 +328,7 @@ impl Editor {
     fn drawing_key(&mut self, key: KeyEvent) {
         let beats = BEATS_PER_BAR as f32;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Enter => self.drawing = None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Enter => self.mode = Mode::Fields(self.field()),
             KeyCode::Tab | KeyCode::BackTab => self.switch_track(),
             KeyCode::Char('w') | KeyCode::Char('e') => self.step_point(1),
             KeyCode::Char('b') => self.step_point(-1),
@@ -318,17 +346,17 @@ impl Editor {
             KeyCode::Char('J') => self.move_point(0.0, -VALUE_JUMP),
             KeyCode::Char('o') | KeyCode::Char('a') => self.add_point(),
             KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => self.delete_point(),
-            KeyCode::Char('s') => self.edit_curve(true, |points, i| curve::toggle_linear(points, *i)),
-            KeyCode::Char('<') => self.edit_curve(true, |points, i| curve::bend(points, *i, -BEND_STEP)),
-            KeyCode::Char('>') => self.edit_curve(true, |points, i| curve::bend(points, *i, BEND_STEP)),
+            KeyCode::Char('s') => self.edit_curve(true, |c, i| c.toggle_linear(*i)),
+            KeyCode::Char('<') => self.edit_curve(true, |c, i| c.bend(*i, -BEND_STEP)),
+            KeyCode::Char('>') => self.edit_curve(true, |c, i| c.bend(*i, BEND_STEP)),
             KeyCode::Char('R') => self.reset_curve(),
             _ => {}
         }
     }
 
     fn step_field(&mut self, by: isize) {
-        let at = FIELDS.iter().position(|f| *f == self.field).unwrap_or(0) as isize;
-        self.field = FIELDS[(at + by).rem_euclid(FIELDS.len() as isize) as usize];
+        let at = FIELDS.iter().position(|f| *f == self.field()).unwrap_or(0) as isize;
+        self.pick_field(FIELDS[(at + by).rem_euclid(FIELDS.len() as isize) as usize]);
     }
 
     fn edit(&mut self, moves_window: bool, f: impl FnOnce(&mut Transition)) {
@@ -363,7 +391,7 @@ impl Editor {
         let step = |g: Option<Grid>| beat_ms(g) * if coarse { f64::from(BEATS_PER_BAR) } else { 1.0 } * f64::from(by);
         match field {
             Field::Preset => self.edit(true, |t| {
-                let at = Preset::ALL.iter().position(|p| *p == t.preset).map_or(0, |i| i as i32 + by);
+                let at = t.preset().and_then(|p| Preset::ALL.iter().position(|q| *q == p)).map_or(0, |i| i as i32 + by);
                 t.set_preset(Preset::ALL[at.rem_euclid(Preset::ALL.len() as i32) as usize]);
             }),
             Field::Length => self.edit(true, |t| {
@@ -377,12 +405,12 @@ impl Editor {
             Field::Eq => self.edit(false, |t| t.set_eq(cycle(&Eq::ALL, t.eq, by))),
             Field::Filter => self.edit(false, |t| t.set_filter(cycle(&Filter::ALL, t.filter, by))),
             Field::Effect => self.edit(false, |t| t.set_effect(cycle(&Effect::ALL, t.effect, by))),
-            Field::Looping => self.edit(false, |t| t.set_looping(cycle(&Looping::ALL, t.looping, by))),
+            Field::Looping => self.edit(false, |t| t.looping = cycle(&Looping::ALL, t.looping, by)),
         }
     }
 
     fn nudge(&mut self, ms: f64) {
-        match self.field {
+        match self.field() {
             Field::Out => self.edit(true, |t| t.out_ms = (t.out_ms + ms).max(0.0)),
             _ => self.edit(true, |t| t.in_ms = (t.in_ms + ms).max(0.0)),
         }
@@ -417,7 +445,7 @@ impl Editor {
 
     /// Starts drawing the chosen field's curves by hand.
     pub fn customize(&mut self) -> Action {
-        match self.field.lane() {
+        match self.field().lane() {
             Some(lane) => self.draw_lane(lane),
             None => Action::Error("Volume, EQ, Filter and Effects have curves to draw; pick one of them".into()),
         }
@@ -428,58 +456,59 @@ impl Editor {
         let Some(track) = [Track::Out, Track::In].into_iter().find(|&k| t.curve(lane, k).is_some()) else {
             return Action::Error(format!("{} is None, so there is no curve to draw: pick a style first", lane.label()));
         };
-        self.field = Field::of(lane);
-        self.drawing = Some(Drawing { lane, track, point: 0 });
+        self.mode = Mode::Drawing(Drawing { lane, track, point: 0 });
         Action::None
     }
 
     /// The curve being drawn.
     pub fn points(&self) -> Option<&[Point]> {
-        let d = self.drawing?;
+        let d = self.drawing()?;
         self.draft.as_ref()?.curve(d.lane, d.track)
     }
 
     /// Keeps the drawing on a curve that exists, after the draft changed under it.
     fn fit_drawing(&mut self) {
-        let (Some(mut d), Some(t)) = (self.drawing, &self.draft) else { return };
+        let (Mode::Drawing(mut d), Some(t)) = (self.mode, &self.draft) else { return };
         if t.curve(d.lane, d.track).is_none() {
             d.track = if d.track == Track::Out { Track::In } else { Track::Out };
         }
-        self.drawing = t.curve(d.lane, d.track).map(|points| Drawing { point: d.point.min(points.len() - 1), ..d });
+        self.mode = match t.curve(d.lane, d.track) {
+            Some(points) => Mode::Drawing(Drawing { point: d.point.min(points.len() - 1), ..d }),
+            None => Mode::Fields(Field::of(d.lane)),
+        };
     }
 
     fn switch_track(&mut self) {
-        let (Some(d), Some(t)) = (self.drawing, &self.draft) else { return };
+        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
         let other = if d.track == Track::Out { Track::In } else { Track::Out };
         if t.curve(d.lane, other).is_some() {
-            self.drawing = Some(Drawing { track: other, ..d });
+            self.mode = Mode::Drawing(Drawing { track: other, ..d });
             self.fit_drawing();
         }
     }
 
     fn step_point(&mut self, by: isize) {
-        let Some(d) = self.drawing else { return };
+        let Some(d) = self.drawing() else { return };
         self.pick_point(d.point.saturating_add_signed(by));
     }
 
     fn pick_point(&mut self, i: usize) {
         let Some(len) = self.points().map(<[Point]>::len) else { return };
-        if let Some(d) = &mut self.drawing {
+        if let Mode::Drawing(d) = &mut self.mode {
             d.point = i.min(len - 1);
         }
     }
 
     /// Redraws the curve being drawn; `record` gives the edit its own undo step.
-    fn edit_curve(&mut self, record: bool, f: impl FnOnce(&mut Vec<Point>, &mut usize)) {
-        let Some(Drawing { lane, track, mut point }) = self.drawing else { return };
+    fn edit_curve(&mut self, record: bool, f: impl FnOnce(&mut Curve, &mut usize)) {
+        let Some(Drawing { lane, track, mut point }) = self.drawing() else { return };
         self.edit_with(false, record, |t| {
-            if let Some(points) = t.curve_mut(lane, track) {
-                f(points, &mut point);
-                point = point.min(points.len() - 1);
-            }
-            t.customize();
+            t.redraw(lane, track, |c| {
+                f(c, &mut point);
+                point = point.min(c.len() - 1);
+            });
         });
-        if let Some(d) = &mut self.drawing {
+        if let Mode::Drawing(d) = &mut self.mode {
             d.point = point;
         }
     }
@@ -491,59 +520,56 @@ impl Editor {
     /// Moves the point by whole beats, landing on the beat.
     fn move_by_beats(&mut self, beats: f32) {
         let per = self.window_beats();
-        self.edit_curve(true, |points, i| {
-            let p = points[*i];
-            curve::move_point(points, *i, ((p.x * per).round() + beats) / per, p.y);
+        self.edit_curve(true, |c, i| {
+            let p = c[*i];
+            c.move_point(*i, ((p.x * per).round() + beats) / per, p.y);
         });
     }
 
     fn move_point(&mut self, dx: f32, dy: f32) {
-        self.edit_curve(true, |points, i| {
-            let p = points[*i];
-            curve::move_point(points, *i, p.x + dx, p.y + dy);
+        self.edit_curve(true, |c, i| {
+            let p = c[*i];
+            c.move_point(*i, p.x + dx, p.y + dy);
         });
     }
 
     /// Adds a point halfway to the next one, or to the previous from the last.
     fn add_point(&mut self) {
-        self.edit_curve(true, |points, i| {
-            let (a, b) = if *i + 1 < points.len() { (*i, *i + 1) } else { (*i - 1, *i) };
-            if let Some(at) = curve::insert(points, (points[a].x + points[b].x) / 2.0) {
+        self.edit_curve(true, |c, i| {
+            let (a, b) = if *i + 1 < c.len() { (*i, *i + 1) } else { (*i - 1, *i) };
+            if let Some(at) = c.insert((c[a].x + c[b].x) / 2.0) {
                 *i = at;
             }
         });
     }
 
     fn delete_point(&mut self) {
-        self.edit_curve(true, |points, i| {
-            curve::remove(points, *i);
+        self.edit_curve(true, |c, i| {
+            c.remove(*i);
         });
     }
 
     /// Goes back to the style's curve for this song.
     fn reset_curve(&mut self) {
-        let Some(d) = self.drawing else { return };
-        self.edit(false, |t| {
-            t.reset_curve(d.lane, d.track);
-            t.customize();
-        });
+        let Some(d) = self.drawing() else { return };
+        self.edit(false, |t| t.reset_curve(d.lane, d.track));
     }
 
     /// A click on a song's curve at `x` through the window: picks the
     /// nearest point within `reach` of it, or on a double click adds one.
     /// Says whether a point is picked to drag.
     pub fn click_curve(&mut self, track: Track, x: f32, reach: f32, double: bool) -> bool {
-        let Some(d) = self.drawing else { return false };
+        let Some(d) = self.drawing() else { return false };
         if d.track != track {
             if self.draft.as_ref().and_then(|t| t.curve(d.lane, track)).is_none() {
                 return false;
             }
-            self.drawing = Some(Drawing { track, point: 0, ..d });
+            self.mode = Mode::Drawing(Drawing { track, point: 0, ..d });
         }
         self.dragged = false;
         if double {
-            self.edit_curve(true, |points, i| {
-                if let Some(at) = curve::insert(points, x) {
+            self.edit_curve(true, |c, i| {
+                if let Some(at) = c.insert(x) {
                     *i = at;
                 }
             });
@@ -567,7 +593,7 @@ impl Editor {
         let on_beat = (x * per).round() / per;
         let x = [on_beat, 0.5].into_iter().find(|s| (s - x).abs() <= snap).unwrap_or(x);
         let record = !std::mem::replace(&mut self.dragged, true);
-        self.edit_curve(record, |points, i| curve::move_point(points, *i, x, y));
+        self.edit_curve(record, |c, i| c.move_point(*i, x, y));
     }
 }
 
@@ -741,7 +767,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     let a_seam = |from: f64, to: f64| {
         to <= timing.duration_ms && looping.as_ref().is_some_and(|m| m.offset(t.out_ms + from) != m.offset(t.out_ms + to))
     };
-    let selected = |f: Field| editor.field == f;
+    let selected = |f: Field| editor.field() == f;
     let lane_label = |name: &str, f: Field| {
         Line::from(Span::styled(format!(" {name}"), if selected(f) { bold(accent()) } else { subtle() }))
     };
@@ -757,7 +783,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     hits.add(mouse::rows(area, first, lines.len() - first), Target::Lane(Field::In, ms_per_col * timing.rate));
     lines.push(Line::raw(""));
 
-    if let Some(drawing) = editor.drawing {
+    if let Some(drawing) = editor.drawing() {
         let plot = Plot { width, t0, ms_per_col, duration_ms: timing.duration_ms, head_col };
         draw_curves(&mut lines, area, hits, t, drawing, &plot);
         frame.render_widget(Paragraph::new(lines).style(Style::new().bg(PANEL)), area);
@@ -841,7 +867,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         _ => "A repeats from the window's start until B takes over".into(),
     };
     let fields = [
-        (Field::Preset, "Preset", t.preset.label().into(), if t.preset == Preset::Custom { "your own styles and curves".into() } else { t.preset.description().into() }),
+        (Field::Preset, "Preset", t.preset_label().into(), t.preset().map_or("your own styles and curves", Preset::description).into()),
         (Field::Length, "Length", bars(t.bars), format!("{:.1} s", timing.duration_ms / 1000.0)),
         (Field::Sync, "Sync", if t.sync { "on".into() } else { "off".into() }, sync_note),
         (Field::Out, "A out", clock_tenths(t.out_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()),
@@ -1183,7 +1209,7 @@ mod tests {
     fn edits_that_change_nothing_leave_it_automatic() {
         let mut ed = editor();
         // Moving a point that can't move on a curve nobody drew yet.
-        ed.field = Field::Volume;
+        ed.pick_field(Field::Volume);
         ed.customize();
         press(&mut ed, "h");
         assert!(!ed.modified() && ed.draft.as_ref().unwrap().auto);
@@ -1193,10 +1219,10 @@ mod tests {
     fn drawing_a_curve_by_hand() {
         let mut ed = editor();
         // Blend: overlap, A's volume holds then fades from 85%.
-        assert_eq!(ed.draft.as_ref().unwrap().preset, Preset::Blend);
-        ed.field = Field::Volume;
+        assert_eq!(ed.draft.as_ref().unwrap().preset(), Some(Preset::Blend));
+        ed.pick_field(Field::Volume);
         assert!(matches!(ed.customize(), Action::None));
-        assert_eq!(ed.drawing.map(|d| (d.lane, d.track, d.point)), Some((Lane::Volume, Track::Out, 0)));
+        assert_eq!(ed.drawing().map(|d| (d.lane, d.track, d.point)), Some((Lane::Volume, Track::Out, 0)));
         // To the middle point, down 25% twice, a bar earlier.
         press(&mut ed, "wJJH");
         let points = ed.points().unwrap().to_vec();
@@ -1205,7 +1231,7 @@ mod tests {
         // 0.85 of a 32-beat window, on the nearest beat (27), then 4 beats back.
         assert!((points[1].x - 23.0 / 32.0).abs() < 1e-6, "{}", points[1].x);
         let t = ed.draft.as_ref().unwrap();
-        assert_eq!(t.preset, Preset::Custom);
+        assert_eq!(t.preset(), None);
         assert!(t.is_custom(Lane::Volume, Track::Out) && !t.is_custom(Lane::Volume, Track::In));
 
         // Add one after it, make that segment straight, bend it, then take it out again.
@@ -1221,44 +1247,47 @@ mod tests {
 
         // B's curve is separate; R puts the style's back.
         ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(ed.drawing.unwrap().track, Track::In);
+        assert_eq!(ed.drawing().unwrap().track, Track::In);
         ed.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         press(&mut ed, "R");
         assert!(ed.draft.as_ref().unwrap().curves.is_empty());
 
-        // Esc goes back to the fields, and the field keys work again.
+        // Esc goes back to the field drawn, though A's waveform was clicked
+        // meanwhile, and the field keys work again.
+        ed.pick_field(Field::Out);
         ed.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(ed.drawing.is_none());
+        assert!(ed.drawing().is_none());
+        assert_eq!(ed.field(), Field::Volume);
         assert!(matches!(ed.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Action::Close));
     }
 
     #[test]
     fn styles_without_curves_have_nothing_to_draw() {
         let mut ed = editor();
-        ed.field = Field::Effect;
+        ed.pick_field(Field::Effect);
         assert!(matches!(ed.customize(), Action::Error(_)), "Blend has no effect");
-        ed.field = Field::Sync;
+        ed.pick_field(Field::Sync);
         assert!(matches!(ed.customize(), Action::Error(_)));
         // A filter only on B starts on B.
-        ed.field = Field::Filter;
+        ed.pick_field(Field::Filter);
         ed.edit(false, |t| t.set_filter(Filter::LowPassIn));
         ed.customize();
-        assert_eq!(ed.drawing.unwrap().track, Track::In);
+        assert_eq!(ed.drawing().unwrap().track, Track::In);
         ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(ed.drawing.unwrap().track, Track::In, "A has no filter to switch to");
+        assert_eq!(ed.drawing().unwrap().track, Track::In, "A has no filter to switch to");
         // Undoing to a style with no curve stops the drawing.
         press(&mut ed, "u");
-        assert!(ed.drawing.is_none());
+        assert!(ed.drawing().is_none());
     }
 
     #[test]
     fn mouse_picks_drags_and_adds_points() {
         let mut ed = editor();
-        ed.field = Field::Eq;
+        ed.pick_field(Field::Eq);
         ed.customize();
         // Blend's bass on A: full until 60%, gone at the end.
         assert!(ed.click_curve(Track::Out, 0.58, 0.03, false));
-        assert_eq!(ed.drawing.unwrap().point, 1);
+        assert_eq!(ed.drawing().unwrap().point, 1);
         ed.drag_point(0.3, 0.9, 0.0);
         ed.drag_point(0.49, 0.2, 0.02);
         let p = ed.points().unwrap()[1];
@@ -1269,7 +1298,7 @@ mod tests {
         assert!(!ed.click_curve(Track::Out, 0.3, 0.03, false), "nothing near");
         assert!(ed.click_curve(Track::Out, 0.3, 0.03, true));
         assert_eq!(ed.points().unwrap().len(), 4);
-        assert_eq!(ed.drawing.unwrap().point, 1);
+        assert_eq!(ed.drawing().unwrap().point, 1);
     }
 
     #[test]
@@ -1282,7 +1311,7 @@ mod tests {
         assert_eq!(ed.cue(Field::In), Some(from + 500.0));
 
         // A nudge off the beat survives a drag.
-        ed.field = Field::In;
+        ed.pick_field(Field::In);
         ed.key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE));
         let nudged = from + 510.0;
         assert_eq!(ed.cue(Field::In), Some(nudged));

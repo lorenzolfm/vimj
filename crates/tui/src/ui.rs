@@ -251,7 +251,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
             let t = &link.transition;
             let (glyph, color) = quality(link.compat.score);
             spans.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
-            let label = format!("{} {}b", t.preset.label(), t.bars);
+            let label = format!("{} {}b", t.preset_label(), t.bars);
             spans.push(Span::styled(fit(&label, cols.link - 7), if t.auto { dim() } else { Style::new().fg(PURPLE) }));
             spans.push(Span::styled(format!("{:>3.0}%", link.compat.score * 100.0), Style::new().fg(color)));
         }

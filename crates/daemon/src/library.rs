@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 
 /// Undo steps kept per playlist.
 const HISTORY: usize = 50;
+/// The format of `library.json`. Bumped whenever this build writes what an
+/// older one can't read, so that an older one refuses the file instead.
+const STORE_VERSION: u32 = 1;
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,6 +54,9 @@ pub struct Playlist {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Store {
+    /// 0 for files from before the format had a number.
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     songs: Vec<Song>,
     #[serde(default)]
@@ -64,7 +70,7 @@ struct Store {
 
 impl Default for Store {
     fn default() -> Store {
-        Store { songs: Vec::new(), playlists: Vec::new(), transitions: HashMap::new(), next_playlist: 1 }
+        Store { version: STORE_VERSION, songs: Vec::new(), playlists: Vec::new(), transitions: HashMap::new(), next_playlist: 1 }
     }
 }
 
@@ -86,9 +92,23 @@ fn pair_key(from: &str, to: &str) -> String {
 }
 
 impl Library {
-    pub fn load(path: PathBuf) -> Library {
-        let store: Store = load_json(&path);
-        Library { path, store, states: HashMap::new(), history: HashMap::new() }
+    /// Reads the library, or starts an empty one where there is none yet. A
+    /// library this build can't read is an error, so that nothing saves over it.
+    pub fn load(path: PathBuf) -> anyhow::Result<Library> {
+        /// Read first, as a newer format may not parse as this one.
+        #[derive(Deserialize)]
+        struct Format {
+            #[serde(default)]
+            version: u32,
+        }
+        if let Some(Format { version }) = load_json(&path)?
+            && version > STORE_VERSION
+        {
+            anyhow::bail!("{} is from a newer vimj (format {version}; this one reads up to {STORE_VERSION})", path.display());
+        }
+        let mut store: Store = load_json(&path)?.unwrap_or_default();
+        store.version = STORE_VERSION;
+        Ok(Library { path, store, states: HashMap::new(), history: HashMap::new() })
     }
 
     #[cfg(test)]
@@ -536,6 +556,45 @@ mod tests {
 
     fn ids(lib: &Library, playlist: &str) -> Vec<String> {
         lib.order(playlist).unwrap()
+    }
+
+    /// A `library.json` path in a fresh directory of its own.
+    fn library_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vimj-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("library.json")
+    }
+
+    /// Loading a library this build can't read fails, rather than starting an
+    /// empty one that the first save would write over it.
+    #[test]
+    fn a_library_this_build_cant_read_doesnt_load() {
+        let style = |volume: &str| {
+            format!(
+                r#"{{"transitions": {{"a>b": {{"volume": "{volume}", "eq": "off", "filter": "none", "effect": "none", "looping": "none", "bars": 4, "out_ms": 0, "in_ms": 0, "sync": true, "auto": false}}}}}}"#
+            )
+        };
+        let path = library_file("styles");
+        std::fs::write(&path, style("smooth")).unwrap();
+        assert!(Library::load(path.clone()).is_ok());
+        // What an older build makes of a style added since.
+        std::fs::write(&path, style("spin_back")).unwrap();
+        assert!(Library::load(path.clone()).is_err());
+
+        let path = library_file("newer");
+        std::fs::write(&path, format!(r#"{{"version": {}}}"#, STORE_VERSION + 1)).unwrap();
+        assert!(Library::load(path).is_err(), "a newer format, even one that parses");
+    }
+
+    #[test]
+    fn libraries_without_a_format_number_load_and_get_one() {
+        let path = library_file("old");
+        assert!(Library::load(path.clone()).unwrap().songs().is_empty(), "no file yet");
+        std::fs::write(&path, r#"{"songs": [], "next_playlist": 3}"#).unwrap();
+        Library::load(path.clone()).unwrap().save();
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], STORE_VERSION);
     }
 
     #[test]

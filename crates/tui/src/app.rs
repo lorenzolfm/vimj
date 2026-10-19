@@ -1062,7 +1062,7 @@ impl App {
         let mut editor = Editor::new(index, list.songs.len(), from.clone(), to.clone());
         if let Some(e) = &self.editor {
             editor.previewing = e.previewing;
-            editor.field = e.field;
+            editor.pick_field(e.field());
         }
         self.ensure_waveform(&from);
         self.ensure_waveform(&to);
@@ -1265,17 +1265,17 @@ impl App {
                 let Some(ed) = self.editor.as_mut() else { return };
                 match target {
                     Target::Field(f) => {
-                        ed.field = f;
+                        ed.pick_field(f);
                         if double && let Action::Error(e) = ed.customize() {
                             self.error(e);
                         }
                     }
                     Target::Step(f, by) => {
-                        ed.field = f;
+                        ed.pick_field(f);
                         ed.change(f, by, false);
                     }
                     Target::Lane(f, ms_per_column) => {
-                        ed.field = f;
+                        ed.pick_field(f);
                         if let Some(from_ms) = ed.cue(f) {
                             self.drag = Some(Drag::Cue { field: f, column, from_ms, ms_per_column });
                         }
@@ -1350,7 +1350,7 @@ impl App {
             // Up raises a value, as on a knob.
             Target::Field(f) | Target::Step(f, _) | Target::Lane(f, _) => {
                 if let Some(ed) = self.editor.as_mut() {
-                    ed.field = f;
+                    ed.pick_field(f);
                     ed.change(f, -down as i32, false);
                 }
             }

@@ -201,7 +201,8 @@ Frontends talk to `vimjd` over HTTP on `127.0.0.1:8787`; `vimj_core::protocol` h
 responses and the events streamed from `GET /api/events`, so a web or desktop frontend can reuse it.
 
 State lives in `~/.config/vimj/config.toml` (music folder, tool paths, browser for cookies, volume)
-and `~/.local/share/vimj/` (the library, waveforms, `vimjd.log`).
+and `~/.local/share/vimj/` (the library, waveforms, `vimjd.log`). If `vimjd` can't read the library,
+say one a newer vimj wrote, it stops and says why in `vimjd.log` rather than start over empty.
 
 `cargo run --release -p vimj-audio --example analyze -- FILE…` prints what analysis finds in files;
 `--example render -- FROM TO OUT.wav [PRESET] [BARS]` renders a transition to listen to. `vimjd

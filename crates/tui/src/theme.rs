@@ -100,7 +100,7 @@ pub fn energy_glyph(energy: f32) -> char {
 /// `Blend · 8 bars`, prefixed with `Auto` when generated.
 pub fn transition_summary(t: &Transition) -> String {
     let lead = if t.auto { "Auto · " } else { "" };
-    format!("{lead}{} · {}", t.preset.label(), bars(t.bars))
+    format!("{lead}{} · {}", t.preset_label(), bars(t.bars))
 }
 
 /// Pads or truncates to exactly `width` terminal columns, with an ellipsis when cut.
