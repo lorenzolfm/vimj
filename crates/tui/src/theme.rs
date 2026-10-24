@@ -17,6 +17,15 @@ pub const SELECTED: Color = Color::Rgb(36, 64, 48);
 pub const PANEL: Color = Color::Rgb(18, 18, 18);
 pub const WARN: Color = Color::Rgb(255, 196, 0);
 pub const ERROR: Color = Color::Rgb(241, 94, 108);
+/// The transition window, a shade lighter than the panel around it.
+pub const WINDOW: Color = Color::Rgb(36, 36, 36);
+
+// One colour for each kind of curve in the transition editor, as in Spotify's.
+pub const VOLUME: Color = Color::Rgb(70, 170, 255);
+pub const EQ: Color = Color::Rgb(255, 210, 50);
+pub const FILTER: Color = Color::Rgb(245, 125, 225);
+pub const EFFECT: Color = Color::Rgb(240, 240, 240);
+pub const LOOPING: Color = Color::Rgb(255, 145, 60);
 
 pub fn text() -> Style {
     Style::new().fg(TEXT)
@@ -59,6 +68,17 @@ pub fn hsl(h: f32, s: f32, l: f32) -> Color {
     };
     let to = |v: f32| ((v + m) * 255.0).round() as u8;
     Color::Rgb(to(r), to(g), to(b))
+}
+
+/// `a` taken `by` of the way to `b`.
+pub fn mix(a: Color, b: Color, by: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let at = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * by).round() as u8;
+            Color::Rgb(at(r1, r2), at(g1, g2), at(b1, b2))
+        }
+        _ => a,
+    }
 }
 
 pub fn energy_color(energy: f32) -> Color {

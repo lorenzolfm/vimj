@@ -109,16 +109,19 @@ Commands: `:add <link>`, `:new <name>`, `:rename <name>`, `:delete`, `:reorder`,
 
 In the transition editor, click a field or the `‹` `›` beside its value, or turn the wheel over it.
 Drag a waveform sideways to move that song's cue point a beat at a time. Click a preset by name, or
-`0 automatic`. Double-click a curve or its field to draw it; then click a point to pick it, drag it
-(it snaps to beats and the middle), or double-click the curve to add one.
+`Auto`. Double-click a curve's field to draw it; then click a point on the waveform to pick it, drag
+it (it snaps to beats and the middle), or double-click the curve to add one.
 
 Hold shift to select text in the terminal as usual.
 
 ### The transition editor
 
-`e` opens it: the outgoing song (A) above the incoming one (B) on one timeline, with bar lines
-(downbeats bright) and the volume, bass, filter and effect curves underneath. When A loops, `↺` marks
-each jump back and the repeats show dimmer.
+`e` opens it: the outgoing song (A) above the incoming one (B) on one timeline, as in Spotify, the
+transition window shaded across both. Each song's curves are drawn over its waveform, one colour per
+kind: volume blue (full at the top), EQ yellow (flat in the middle, cuts go down; the fainter lines
+are the mids and highs), filter pink (open in the middle, a high-pass closes upwards and a low-pass
+downwards; noise grows upwards), effects white (more send, higher). Bar lines run above A and below
+B. When A loops, `↺` marks each jump back and the repeats show dimmer.
 
 | | |
 | --- | --- |
@@ -153,15 +156,15 @@ every ½, ¾ or 1 beat. A loop replays A from the start of the window until it e
 
 #### Drawing curves
 
-`c` shows A's and B's curves for the field one above the other, as Spotify's Customise does. A song
-the style leaves alone (no filter on B, say) has no curve. Picking another style, or a preset, puts
-the style's curves back.
+`c` puts points on the field's curves, right on the waveforms, as Spotify's Customise does, and dims
+the other curves. A song the style leaves alone (no filter on B, say) has no curve. Picking another
+style, or a preset, puts the style's curves back.
 
 | | |
 | --- | --- |
 | `w` `b`, `0` `$` | next / previous point, first / last |
 | `h` `l`, `H` `L` | move the point by a beat, by a bar; `,` `.` nudge it |
-| `j` `k`, `J` `K` | value down / up by 5%, by 25% |
+| `j` `k`, `J` `K` | move the point down / up by 5%, by 25% |
 | `o` | add a point after this one |
 | `x` | delete it (the first and last points stay, and only move up and down) |
 | `s` | ease the segment after it in and out, or run it straight |

@@ -36,8 +36,8 @@ pub enum Target {
     /// A song's lanes in the transition editor, and how many ms of that
     /// song each column shows.
     Lane(Field, f64),
-    /// A song's curve while drawing one: `t0` is the ms from the start of
-    /// the window at its left edge.
+    /// A song's curve while drawing one, over its waveform: `t0` is the ms
+    /// from the start of the window at its left edge.
     Curve { track: Track, t0: f64, ms_per_col: f64, duration_ms: f64 },
     Preset(usize),
     Automatic,

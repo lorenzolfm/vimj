@@ -1,5 +1,6 @@
 //! The transition editor: both songs' waveforms lined up on one timeline,
-//! the volume, EQ, filter and effect curves under them, and a field list
+//! each with its volume, EQ, filter and effect curves drawn over it in one
+//! colour per kind, as Spotify's editor has them, and a field list
 //! edited the vim way: `j`/`k` pick a field, `h`/`l` change it. `c` draws a
 //! field's curves by hand, point by point, as Spotify's Customise does.
 //! Edits stay in a draft until `:w` stores them, as in a vim buffer, and `u`
@@ -12,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use vimj_core::curve::{self, Curve, Point};
 use vimj_core::model::{BEATS_PER_BAR, Grid};
 use vimj_core::protocol::{PlayerState, SongInfo, TransitionDetail};
-use vimj_core::transition::{BAR_CHOICES, DeckFx, Effect, Eq, Filter, FilterKind, Lane, Looping, Preset, Side, Track, Transition, Volume};
+use vimj_core::transition::{BAR_CHOICES, Effect, Eq, Filter, FilterKind, Lane, Looping, Preset, Side, Track, Transition, Volume};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -21,6 +22,7 @@ use ratatui::widgets::Paragraph;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 /// A running preview picks up edits this long after the last one.
 const PREVIEW_AFTER: Duration = Duration::from_millis(300);
@@ -37,8 +39,6 @@ const VALUE_JUMP: f32 = 0.25;
 const POINT_NUDGE: f32 = 0.01;
 /// `<`/`>` bend a segment by this much.
 const BEND_STEP: f32 = 0.1;
-/// Rows of each song's curve while drawing one.
-const PLOT_ROWS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -341,10 +341,10 @@ impl Editor {
             KeyCode::Char('L') => self.move_by_beats(beats),
             KeyCode::Char(',') => self.move_point(-POINT_NUDGE, 0.0),
             KeyCode::Char('.') => self.move_point(POINT_NUDGE, 0.0),
-            KeyCode::Char('k') | KeyCode::Up => self.move_point(0.0, VALUE_STEP),
-            KeyCode::Char('j') | KeyCode::Down => self.move_point(0.0, -VALUE_STEP),
-            KeyCode::Char('K') => self.move_point(0.0, VALUE_JUMP),
-            KeyCode::Char('J') => self.move_point(0.0, -VALUE_JUMP),
+            KeyCode::Char('k') | KeyCode::Up => self.raise(VALUE_STEP),
+            KeyCode::Char('j') | KeyCode::Down => self.raise(-VALUE_STEP),
+            KeyCode::Char('K') => self.raise(VALUE_JUMP),
+            KeyCode::Char('J') => self.raise(-VALUE_JUMP),
             KeyCode::Char('o') | KeyCode::Char('a') => self.add_point(),
             KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => self.delete_point(),
             KeyCode::Char('s') => self.edit_curve(true, |c, i| c.toggle_linear(*i)),
@@ -534,6 +534,14 @@ impl Editor {
         });
     }
 
+    /// Moves the point `by` up the lane as it is drawn, which lowers the
+    /// value of a low-pass, as that closes downwards.
+    fn raise(&mut self, by: f32) {
+        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
+        let dy = by * Scale::of(t, d.lane, d.track).up();
+        self.move_point(0.0, dy);
+    }
+
     /// Adds a point halfway to the next one, or to the previous from the last.
     fn add_point(&mut self) {
         self.edit_curve(true, |c, i| {
@@ -583,9 +591,18 @@ impl Editor {
         true
     }
 
-    /// Drags the picked point to (`x`, `y`), onto a beat or the middle when
-    /// within `snap` of one. A whole drag is one undo step.
-    pub fn drag_point(&mut self, x: f32, y: f32, snap: f32) {
+    /// Drags `track`'s picked point to `x` through the window and `height` up
+    /// its lane, onto a beat or the middle when within `snap` of one. A whole
+    /// drag is one undo step. Once a key has moved the drawing to the other
+    /// song, the drag moves nothing.
+    pub fn drag_point(&mut self, track: Track, x: f32, height: f32, snap: f32) {
+        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
+        if d.track != track {
+            return;
+        }
+        // The lane's scale now, not as the drag found it: `u` can turn a
+        // high-pass into a low-pass under it.
+        let y = Scale::of(t, d.lane, track).value(height);
         let per = self.window_beats();
         let on_beat = (x * per).round() / per;
         let x = [on_beat, 0.5].into_iter().find(|s| (s - x).abs() <= snap).unwrap_or(x);
@@ -650,269 +667,74 @@ fn custom_on(t: &Transition, lane: Lane) -> &'static str {
 /// Braille dots by column (left, right) and row from the top.
 const DOTS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 
-/// Draws the editor over `area`, noting what can be clicked in `hits`.
-pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<String, Arc<Vec<u8>>>, player: Option<&PlayerState>, hits: &mut Hits) {
-    let (Some(detail), Some(t)) = (&editor.detail, &editor.draft) else {
-        frame.render_widget(Paragraph::new(Line::styled("  Loading transition…", dim())), area);
-        return;
-    };
-    let width = area.width.saturating_sub(4) as usize;
-    let (ga, gb) = (detail.from.song.analysis.as_ref().and_then(|a| a.grid), detail.to.song.analysis.as_ref().and_then(|a| a.grid));
-    let timing = t.timing(ga.as_ref(), gb.as_ref());
-    let looping = t.loop_map(ga.as_ref());
-    let mut lines: Vec<Line> = Vec::new();
+/// Rows of each song's waveform: at least, and at most.
+const MIN_LANE_ROWS: usize = 4;
+const MAX_LANE_ROWS: usize = 12;
+/// Rows the editor takes besides the two waveforms.
+const OTHER_ROWS: usize = 18;
+/// The timeline shows this much of the window's length either side of it,
+/// and at least `MIN_PAD_MS`.
+const PAD: f64 = 0.25;
+const MIN_PAD_MS: f64 = 2_000.0;
+/// The fields, in two columns under the waveforms.
+const COLUMNS: [[Field; 5]; 2] = [
+    [Field::Preset, Field::Length, Field::Sync, Field::Out, Field::In],
+    [Field::Volume, Field::Eq, Field::Filter, Field::Effect, Field::Looping],
+];
+/// Where the second column of fields starts.
+const SECOND_COLUMN: usize = 30;
 
-    // Header: the pair, and how well they match.
-    let song_label = |s: &SongInfo| {
-        let a = s.song.analysis.as_ref();
-        let mut spans = vec![Span::styled(s.song.title.clone(), bold(text()))];
-        if !s.song.artist.is_empty() {
-            spans.push(Span::styled(format!(" — {}", s.song.artist), subtle()));
-        }
-        if let Some(bpm) = a.and_then(|a| a.bpm()) {
-            spans.push(Span::styled(format!("  {bpm:.1} BPM"), subtle()));
-        }
-        if let Some(c) = theme::camelot(a) {
-            spans.push(Span::styled(format!("  {c}"), Style::new().fg(camelot_color(c))));
-        }
-        spans
-    };
-    lines.push(Line::from(vec![
-        Span::styled(format!(" Transition {}/{}", editor.index + 1, editor.count.saturating_sub(1)), bold(accent())),
-        Span::styled(if t.auto { "   automatic" } else { "   edited" }, dim()),
-        Span::styled(if editor.modified() { "   [+] not saved, :w saves" } else { "" }, Style::new().fg(WARN)),
-        Span::styled(if editor.previewing { "   ▶ previewing" } else { "" }, accent()),
-    ]));
-    let mut pair = vec![Span::raw(" A  ")];
-    pair.extend(song_label(&detail.from));
-    lines.push(Line::from(pair));
-    let mut pair = vec![Span::raw(" B  ")];
-    pair.extend(song_label(&detail.to));
-    lines.push(Line::from(pair));
-    let mut matching = vec![Span::styled("    ", dim())];
-    matching.extend(crate::ui::compat_spans(&detail.compat));
-    lines.push(Line::from(matching));
-    lines.push(Line::raw(""));
-
-    // Timeline: the window plus half its length either side.
-    let pad = (timing.duration_ms * 0.5).max(4_000.0);
-    let (t0, t1) = (-pad, timing.duration_ms + pad);
-    let ms_per_col = (t1 - t0) / width.max(1) as f64;
-    let col_time = |c: usize| t0 + c as f64 * ms_per_col;
-    let playhead = player.filter(|p| p.preview && editor.previewing).and_then(|p| preview_time(p, t, &timing));
-    let head_col = playhead.map(|ms| ((ms - t0) / ms_per_col) as isize);
-
-    let lane = |wave: Option<&Arc<Vec<u8>>>, position: &dyn Fn(f64) -> f64, lit: &dyn Fn(f64) -> bool, height: usize| -> Vec<Line<'static>> {
-        let mut rows: Vec<Vec<Span>> = vec![Vec::new(); height];
-        for c in 0..width {
-            let (from, to) = (position(col_time(c)), position(col_time(c + 1)));
-            let column = wave.and_then(|w| wave::column(w, from.min(to), from.max(to)));
-            let on = lit(col_time(c));
-            let level = column.map_or(0.0, |col| col.peak);
-            let color = column.map_or(FAINT, |col| wave::color(col, on));
-            let eighths = (level * (height * 8) as f32).round() as usize;
-            let at_head = head_col == Some(c as isize);
-            for (r, row) in rows.iter_mut().enumerate() {
-                // Rows run top to bottom; fill from the bottom.
-                let from_bottom = height - 1 - r;
-                let fill = eighths.saturating_sub(from_bottom * 8).min(8);
-                let glyph = if at_head { '│' } else { BLOCKS[fill] };
-                let style = if at_head { Style::new().fg(TEXT) } else { Style::new().fg(color) };
-                row.push(Span::styled(glyph.to_string(), style));
-            }
-        }
-        rows.into_iter().map(|mut r| {
-            r.insert(0, Span::raw("  "));
-            Line::from(r)
-        }).collect()
-    };
-    let ruler = |grid: Option<Grid>, position: &dyn Fn(f64) -> f64, lit: &dyn Fn(f64) -> bool, seam: &dyn Fn(f64, f64) -> bool| -> Line<'static> {
-        let mut spans = vec![Span::raw("  ")];
-        for c in 0..width {
-            let (from, to) = (position(col_time(c)), position(col_time(c + 1)));
-            let glyph = match grid {
-                _ if seam(col_time(c), col_time(c + 1)) => '↺',
-                Some(_) if to <= 0.0 => ' ',
-                Some(g) => {
-                    let first = g.beat_at(from).ceil();
-                    if g.beat_time(first) < to {
-                        if first.rem_euclid(4.0) == 0.0 { '┃' } else { '╵' }
-                    } else {
-                        ' '
-                    }
-                }
-                None => ' ',
-            };
-            let on = lit(col_time(c));
-            let color = match glyph {
-                '↺' => WARN,
-                '┃' if on => GREEN,
-                '┃' => SUBTLE,
-                _ => DIM,
-            };
-            spans.push(Span::styled(glyph.to_string(), Style::new().fg(color)));
-        }
-        Line::from(spans)
-    };
-
-    // A plays through its loop, if it has one; the repeats show dimmer.
-    let a_pos = |ms: f64| {
-        let at = t.out_ms + ms;
-        at + looping.as_ref().filter(|_| ms < timing.duration_ms).map_or(0.0, |m| m.offset(at))
-    };
-    let b_pos = |ms: f64| t.in_ms + ms * timing.rate;
-    let a_lit = |ms: f64| ms < timing.duration_ms && !looping.as_ref().is_some_and(|m| m.repeating(t.out_ms + ms));
-    let b_lit = |ms: f64| ms >= 0.0;
-    let a_seam = |from: f64, to: f64| {
-        to <= timing.duration_ms && looping.as_ref().is_some_and(|m| m.offset(t.out_ms + from) != m.offset(t.out_ms + to))
-    };
-    let selected = |f: Field| editor.field() == f;
-    let lane_label = |name: &str, f: Field| {
-        Line::from(Span::styled(format!(" {name}"), if selected(f) { bold(accent()) } else { subtle() }))
-    };
-    let first = lines.len();
-    lines.push(lane_label(&format!("A leaves at {} (beat {})", clock_tenths(t.out_ms), beat_label(ga, t.out_ms)), Field::Out));
-    lines.extend(lane(waveforms.get(&detail.from.song.id), &a_pos, &a_lit, 3));
-    lines.push(ruler(ga, &|ms| t.out_ms + ms, &a_lit, &a_seam));
-    hits.add(mouse::rows(area, first, lines.len() - first), Target::Lane(Field::Out, ms_per_col));
-    let first = lines.len();
-    lines.push(lane_label(&format!("B enters at {} (beat {})", clock_tenths(t.in_ms), beat_label(gb, t.in_ms)), Field::In));
-    lines.extend(lane(waveforms.get(&detail.to.song.id), &b_pos, &b_lit, 3));
-    lines.push(ruler(gb, &b_pos, &b_lit, &|_, _| false));
-    hits.add(mouse::rows(area, first, lines.len() - first), Target::Lane(Field::In, ms_per_col * timing.rate));
-    lines.push(Line::raw(""));
-
-    if let Some(drawing) = editor.drawing() {
-        let plot = Plot { width, t0, ms_per_col, duration_ms: timing.duration_ms, head_col };
-        draw_curves(&mut lines, area, hits, t, drawing, &plot);
-        frame.render_widget(Paragraph::new(lines).style(Style::new().bg(PANEL)), area);
-        return;
+fn lane_color(lane: Lane) -> Color {
+    match lane {
+        Lane::Volume => VOLUME,
+        Lane::Eq => EQ,
+        Lane::Filter => FILTER,
+        Lane::Effect => EFFECT,
     }
-
-    // Automation curves.
-    // A deck that isn't playing shows as fully off in every lane.
-    let silent = DeckFx { gain: 0.0, eq: [0.0; 3], ..DeckFx::FLAT };
-    let point = |ms: f64| -> (DeckFx, DeckFx) {
-        if ms < 0.0 {
-            (DeckFx::FLAT, silent)
-        } else if ms >= timing.duration_ms {
-            (silent, DeckFx::FLAT)
-        } else {
-            let m = t.at((ms / timing.duration_ms) as f32);
-            (m.out, m.inc)
-        }
-    };
-    let curve = |name: &str, f: Field, value: &dyn Fn(&DeckFx) -> f32| -> Line<'static> {
-        let custom = f.lane().is_some_and(|lane| !custom_on(t, lane).is_empty());
-        let color = if custom { Style::new().fg(WARN) } else if selected(f) { accent() } else { subtle() };
-        let label_style = if selected(f) { bold(color) } else { color };
-        let mut spans = vec![Span::styled(format!(" {name:<3}"), label_style)];
-        for c in 0..width.saturating_sub(2) {
-            let (a, b) = point(col_time(c + 2));
-            let (va, vb) = (value(&a).clamp(0.0, 1.0), value(&b).clamp(0.0, 1.0));
-            spans.push(two_levels(va, vb));
-        }
-        Line::from(spans)
-    };
-    let first = lines.len();
-    lines.push(curve("VOL", Field::Volume, &|d| d.gain));
-    lines.push(curve("EQ", Field::Eq, &|d| d.eq[0]));
-    lines.push(curve("FLT", Field::Filter, &|d| d.filter.abs().max(d.noise)));
-    lines.push(curve("FX", Field::Effect, &|d| d.send));
-    for (k, f) in [Field::Volume, Field::Eq, Field::Filter, Field::Effect].into_iter().enumerate() {
-        hits.add(mouse::rows(area, first + k, 1), Target::Field(f));
-    }
-    lines.push(Line::from(vec![
-        Span::styled("     ", dim()),
-        Span::styled("▀ A (outgoing)", Style::new().fg(GREEN)),
-        Span::styled("   ▄ B (incoming)", Style::new().fg(PURPLE)),
-        Span::styled("   █ both", Style::new().fg(TEXT)),
-        Span::styled("   yellow: drawn by hand", Style::new().fg(WARN)),
-    ]));
-    lines.push(Line::raw(""));
-
-    // Fields.
-    let field = |f: Field, name: &str, value: String, note: String| -> Line<'static> {
-        let on = selected(f);
-        let marker = if on { "▸ " } else { "  " };
-        let value_style = if on { bold(accent()) } else { text() };
-        Line::from(vec![
-            Span::styled(format!(" {marker}{name:<8}"), if on { bold(text()) } else { subtle() }),
-            Span::styled(if on { format!("‹ {value} ›") } else { format!("  {value}  ") }, value_style),
-            Span::styled(format!("  {note}"), dim()),
-        ])
-    };
-    let sync_note = match (t.sync, ga.zip(gb)) {
-        (true, Some(_)) if (timing.rate - 1.0).abs() > 1e-6 => format!("B plays at {:.1}% to lock the beats, then eases back", timing.rate * 100.0),
-        (true, Some(_)) => "same tempo, beats locked".into(),
-        (true, None) => "needs both tempos".into(),
-        (false, _) => "tempos left alone".into(),
-    };
-    let curve_note = |f: Field, extra: String| -> String {
-        let Some(lane) = f.lane() else { return extra };
-        let custom = custom_on(t, lane);
-        let drawn = if custom.is_empty() { String::new() } else { format!("curve drawn by hand on {custom}") };
-        let hint = if selected(f) && [Track::Out, Track::In].iter().any(|&k| t.curve(lane, k).is_some()) { "c to draw your own" } else { "" };
-        [extra, drawn, hint.into()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
-    };
-    let effect_note = match t.effect.kind() {
-        Some(_) if t.effect.rings_out() => "on A, and rings on after the window".into(),
-        Some(_) => "on A, cut where the window ends".into(),
-        None => String::new(),
-    };
-    let loop_note = match t.looping {
-        Looping::None => String::new(),
-        Looping::Halving => "A repeats from the window's start, half as long each time".into(),
-        _ => "A repeats from the window's start until B takes over".into(),
-    };
-    let fields = [
-        (Field::Preset, "Preset", t.preset_label().into(), t.preset().map_or("your own styles and curves", Preset::description).into()),
-        (Field::Length, "Length", bars(t.bars), format!("{:.1} s", timing.duration_ms / 1000.0)),
-        (Field::Sync, "Sync", if t.sync { "on".into() } else { "off".into() }, sync_note),
-        (Field::Out, "A out", clock_tenths(t.out_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()),
-        (Field::In, "B in", clock_tenths(t.in_ms), "h/l beat · H/L bar · w/b phrase · ,/. 10 ms".into()),
-        (Field::Volume, "Volume", t.volume.label().into(), curve_note(Field::Volume, String::new())),
-        (Field::Eq, "EQ", t.eq.label().into(), curve_note(Field::Eq, String::new())),
-        (Field::Filter, "Filter", t.filter.label().into(), curve_note(Field::Filter, String::new())),
-        (Field::Effect, "Effects", t.effect.label().into(), curve_note(Field::Effect, effect_note)),
-        (Field::Looping, "Looping", t.looping.label().into(), loop_note),
-    ];
-    for (f, name, value, note) in fields {
-        let line = field(f, name, value, note);
-        let row = mouse::rows(area, lines.len(), 1);
-        hits.add(row, Target::Field(f));
-        if selected(f) {
-            // `‹ value ›`: each arrow and the space beside it.
-            let (x, width) = (line.spans[0].width(), line.spans[1].width());
-            hits.add(mouse::columns(row, x, 2), Target::Step(f, -1));
-            hits.add(mouse::columns(row, (x + width).saturating_sub(2), 2), Target::Step(f, 1));
-        }
-        lines.push(line);
-    }
-    lines.push(Line::raw(""));
-    let row = mouse::rows(area, lines.len(), 1);
-    let mut presets = vec![Span::raw(" ")];
-    for (i, p) in Preset::ALL.iter().enumerate() {
-        let x: usize = presets.iter().map(Span::width).sum();
-        let label = format!("{}{}", i + 1, p.label());
-        hits.add(mouse::columns(row, x, label.len()), Target::Preset(i));
-        presets.push(Span::styled(format!("{label} "), dim()));
-    }
-    presets.push(Span::styled("· ", dim()));
-    let x: usize = presets.iter().map(Span::width).sum();
-    hits.add(mouse::columns(row, x, "0 automatic".len()), Target::Automatic);
-    presets.push(Span::styled("0 automatic", dim()));
-    lines.push(Line::from(presets));
-    lines.push(Line::styled(
-        " j/k field · h/l change · c draw curves · space preview loop · u undo · [ ] other transitions · s sync · +/- length · :w save · esc close",
-        dim(),
-    ));
-
-    frame.render_widget(Paragraph::new(lines).style(Style::new().bg(PANEL)), area);
 }
 
-/// Where the timeline's columns fall, for the curves drawn by hand.
-struct Plot {
+/// Where a lane's values sit up a song's waveform, as fractions of its
+/// height: value 0 at `zero` and 1 at `one`. Volume and effects fill it
+/// from the bottom. EQ rests in the middle and cuts down from there. The
+/// filter is open in the middle, a high-pass closing upwards and a low-pass
+/// downwards, as on a DJ mixer's one filter knob, and noise grows upwards
+/// from there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Scale {
+    zero: f32,
+    one: f32,
+}
+
+impl Scale {
+    fn of(t: &Transition, lane: Lane, track: Track) -> Scale {
+        match lane {
+            Lane::Volume | Lane::Effect => Scale { zero: 0.0, one: 1.0 },
+            Lane::Eq => Scale { zero: 0.0, one: 0.5 },
+            Lane::Filter => match t.filter.kind(track) {
+                Some(FilterKind::LowPass) => Scale { zero: 0.5, one: 0.0 },
+                // A song the filter leaves alone has no curve to place.
+                Some(FilterKind::HighPass | FilterKind::Noise) | None => Scale { zero: 0.5, one: 1.0 },
+            },
+        }
+    }
+
+    fn height(self, value: f32) -> f32 {
+        self.zero + value.clamp(0.0, 1.0) * (self.one - self.zero)
+    }
+
+    /// The value at `height`; past either end, that end's.
+    fn value(self, height: f32) -> f32 {
+        ((height - self.zero) / (self.one - self.zero)).clamp(0.0, 1.0)
+    }
+
+    /// 1 where higher values sit higher up, -1 where they sit lower.
+    fn up(self) -> f32 {
+        (self.one - self.zero).signum()
+    }
+}
+
+/// Where the timeline's columns fall.
+struct Timeline {
     width: usize,
     /// Ms from the start of the window at the left edge of column 0.
     t0: f64,
@@ -921,51 +743,104 @@ struct Plot {
     head_col: Option<isize>,
 }
 
-impl Plot {
+impl Timeline {
+    /// Ms from the start of the window at `c` columns in.
+    fn time(&self, c: f64) -> f64 {
+        self.t0 + c * self.ms_per_col
+    }
+
     /// Progress through the window at a point across column `c`.
     fn x(&self, c: usize, across: f64) -> f64 {
-        (self.t0 + (c as f64 + across) * self.ms_per_col) / self.duration_ms
+        self.time(c as f64 + across) / self.duration_ms
     }
 
     fn column(&self, x: f32) -> isize {
         ((f64::from(x) * self.duration_ms - self.t0) / self.ms_per_col).floor() as isize
     }
+
+    fn in_window(&self, c: usize) -> bool {
+        (0.0..self.duration_ms).contains(&self.time(c as f64 + 0.5))
+    }
 }
 
-/// Both songs' curves for the lane being drawn, one above the other, then
-/// the point picked and the keys.
-fn draw_curves(lines: &mut Vec<Line<'static>>, area: Rect, hits: &mut Hits, t: &Transition, drawing: Drawing, plot: &Plot) {
-    let dots = PLOT_ROWS * 4;
-    let level = |v: f32| (v.clamp(0.0, 1.0) * (dots - 1) as f32).round() as usize;
-    for track in [Track::Out, Track::In] {
-        let active = track == drawing.track;
-        let color = match (track, active) {
-            (Track::Out, true) => GREEN,
-            (Track::In, true) => PURPLE,
-            _ => DIM,
-        };
-        let name = track_name(track);
-        let points = t.curve(drawing.lane, track);
-        let label = match points {
-            Some(_) if t.is_custom(drawing.lane, track) => format!(" {name}  {} · drawn by hand", drawing.lane.label()),
-            Some(_) => format!(" {name}  {} · {}", drawing.lane.label(), style_name(t, drawing.lane)),
-            None => format!(" {name}  no {} on {name}", drawing.lane.label().to_lowercase()),
-        };
-        lines.push(Line::styled(label, if active { bold(Style::new().fg(color)) } else { subtle() }));
+/// A curve drawn over a song's waveform: its height through the window,
+/// 0 at the bottom and 1 at the top.
+struct Trace<'a> {
+    color: Color,
+    height: Box<dyn Fn(f32) -> f32 + 'a>,
+}
 
-        // Braille dots, by column and then row.
-        let mut cells = vec![[0u8; PLOT_ROWS]; plot.width];
-        let mut marks: Vec<(usize, usize, bool)> = Vec::new();
-        if let Some(points) = points {
+/// A curve's point while drawing it, at `x` through the window.
+struct Mark {
+    x: f32,
+    height: f32,
+    glyph: &'static str,
+    style: Style,
+}
+
+/// The curves over one song, topmost first: the field picked, then the
+/// rest. While drawing, the curves not being drawn are dimmed.
+fn traces(t: &Transition, track: Track, focus: Option<Lane>, drawing: bool) -> Vec<Trace<'_>> {
+    let order = [Lane::Volume, Lane::Filter, Lane::Eq, Lane::Effect];
+    let mut traces = Vec::new();
+    for lane in focus.into_iter().chain(order.into_iter().filter(|&l| Some(l) != focus)) {
+        let Some(points) = t.curve(lane, track) else { continue };
+        let drawn = drawing && focus == Some(lane);
+        // EQ left flat on a song says nothing, unless it's being drawn.
+        if lane == Lane::Eq && !drawn && points.iter().all(|p| p.y >= 1.0) {
+            continue;
+        }
+        let scale = Scale::of(t, lane, track);
+        let color = if drawing && !drawn { mix(lane_color(lane), WINDOW, 0.6) } else { lane_color(lane) };
+        traces.push(Trace { color, height: Box::new(move |x| scale.height(curve::value(points, x))) });
+    }
+    // The EQ's mid and high bands, fainter, under the rest.
+    let scale = Scale::of(t, Lane::Eq, track);
+    for band in 1..3 {
+        let value = move |x: f32| {
+            let m = t.at(x);
+            if track == Track::Out { m.out.eq[band] } else { m.inc.eq[band] }
+        };
+        if (0..=32).all(|i| value(i as f32 / 32.0) >= 1.0) {
+            continue;
+        }
+        let color = mix(EQ, WINDOW, if drawing { 0.75 } else { 0.55 });
+        traces.push(Trace { color, height: Box::new(move |x| scale.height(value(x))) });
+    }
+    traces
+}
+
+/// A song's waveform, mirrored about its middle, with `traces` drawn over
+/// it and `marks` over those. `position` is where in the song each ms of the
+/// timeline falls, and `heard` whether it plays then.
+fn song_rows(
+    tl: &Timeline,
+    wave: Option<&Arc<Vec<u8>>>,
+    position: &dyn Fn(f64) -> f64,
+    heard: &dyn Fn(f64) -> bool,
+    traces: &[Trace],
+    marks: &[Mark],
+    rows: usize,
+) -> Vec<Line<'static>> {
+    let dots = rows * 4;
+    // In eighths of a row from the bottom.
+    let middle = rows * 4;
+    let level = |h: f32| (h.clamp(0.0, 1.0) * (dots - 1) as f32).round() as usize;
+
+    // Each trace's braille dots, by column and then row.
+    let plots: Vec<Vec<Vec<u8>>> = traces
+        .iter()
+        .map(|trace| {
+            let mut cells = vec![vec![0u8; rows]; tl.width];
             let mut prev: Option<usize> = None;
             for (c, column) in cells.iter_mut().enumerate() {
                 for (half, bits) in DOTS.iter().enumerate() {
-                    let x = plot.x(c, 0.25 + 0.5 * half as f64);
+                    let x = tl.x(c, 0.25 + 0.5 * half as f64);
                     if !(0.0..=1.0).contains(&x) {
                         prev = None;
                         continue;
                     }
-                    let now = level(curve::value(points, x as f32));
+                    let now = level((trace.height)(x as f32));
                     // Join to the last dot so that steep parts stay unbroken.
                     for d in prev.map_or(now, |p| p.min(now))..=prev.map_or(now, |p| p.max(now)) {
                         let from_top = dots - 1 - d;
@@ -974,56 +849,429 @@ fn draw_curves(lines: &mut Vec<Line<'static>>, area: Rect, hits: &mut Hits, t: &
                     prev = Some(now);
                 }
             }
-            for (i, p) in points.iter().enumerate() {
-                let c = plot.column(p.x).clamp(0, plot.width.saturating_sub(1) as isize) as usize;
-                let row = (dots - 1 - level(p.y)) / 4;
-                marks.push((row, c, active && i == drawing.point));
-            }
-        }
-        let first = lines.len();
-        for r in 0..PLOT_ROWS {
+            cells
+        })
+        .collect();
+    let marks: Vec<(usize, usize, &Mark)> = marks
+        .iter()
+        .map(|m| (tl.column(m.x).clamp(0, tl.width.saturating_sub(1) as isize) as usize, (dots - 1 - level(m.height)) / 4, m))
+        .collect();
+    // Each column's background, waveform colour, and how far the waveform
+    // reaches either side of the middle.
+    let columns: Vec<(Color, Color, usize)> = (0..tl.width)
+        .map(|c| {
+            let start = tl.time(c as f64);
+            let (from, to) = (position(start), position(tl.time(c as f64 + 1.0)));
+            let column = wave.and_then(|w| wave::column(w, from.min(to), from.max(to)));
+            let base = if tl.in_window(c) { WINDOW } else { PANEL };
+            let color = column.map_or(FAINT, |col| wave::color(col, heard(start)));
+            // Short of the top and bottom rows, where full and silent curves run.
+            let reach = column.map_or(0, |col| ((col.level * (middle - 8) as f32).round() as usize).max(1));
+            (base, color, reach)
+        })
+        .collect();
+
+    (0..rows)
+        .map(|r| {
             let mut spans = vec![Span::raw("  ")];
-            for (c, bits) in cells.iter().map(|column| column[r]).enumerate() {
-                let mark = marks.iter().filter(|m| m.0 == r && m.1 == c).map(|m| m.2).reduce(|a, b| a || b);
-                let span = match mark {
-                    Some(true) => Span::styled("◆", bold(Style::new().fg(WARN))),
-                    Some(false) => Span::styled("●", Style::new().fg(if active { TEXT } else { DIM })),
-                    None if plot.head_col == Some(c as isize) => Span::styled("│", Style::new().fg(TEXT)),
-                    None if bits != 0 => Span::styled(char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ').to_string(), Style::new().fg(color)),
-                    // Faint dots mark out the window.
-                    None if r == PLOT_ROWS - 1 && (0.0..=1.0).contains(&plot.x(c, 0.5)) => Span::styled("⣀", Style::new().fg(FAINT)),
-                    None => Span::raw(" "),
+            for (c, &(base, color, reach)) in columns.iter().enumerate() {
+                let bottom = (rows - 1 - r) * 8;
+                // Eighths of the cell the waveform covers: from the cell's
+                // bottom above the middle, from its top below.
+                let (cover, above) = if bottom >= middle {
+                    ((middle + reach).saturating_sub(bottom).min(8), true)
+                } else {
+                    ((bottom + 8).saturating_sub(middle.saturating_sub(reach).max(bottom)), false)
+                };
+                let under = if cover >= 4 { color } else { base };
+                let mark = marks.iter().find(|m| m.0 == c && m.1 == r).map(|m| m.2);
+                let trace = plots.iter().position(|p| p[c][r] != 0);
+                let span = if tl.head_col == Some(c as isize) {
+                    Span::styled("│", Style::new().fg(TEXT).bg(base))
+                } else if let Some(m) = mark {
+                    Span::styled(m.glyph, m.style.bg(under))
+                } else if let Some(k) = trace {
+                    let glyph = char::from_u32(0x2800 + u32::from(plots[k][c][r])).unwrap_or(' ');
+                    Span::styled(glyph.to_string(), Style::new().fg(traces[k].color).bg(under))
+                } else if cover == 0 {
+                    Span::styled(" ", Style::new().bg(base))
+                } else if above {
+                    Span::styled(BLOCKS[cover].to_string(), Style::new().fg(color).bg(base))
+                } else {
+                    // The top `cover` eighths: the rest drawn in the background over the waveform's colour.
+                    Span::styled(BLOCKS[8 - cover].to_string(), Style::new().fg(base).bg(color))
                 };
                 spans.push(span);
             }
-            lines.push(Line::from(spans));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// A song's beats along the timeline, bars taller; `↺` where a loop jumps
+/// back. `down` points the beats down, for the ruler over a waveform.
+fn ruler(
+    tl: &Timeline,
+    grid: Option<Grid>,
+    position: &dyn Fn(f64) -> f64,
+    heard: &dyn Fn(f64) -> bool,
+    seam: &dyn Fn(f64, f64) -> bool,
+    down: bool,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for c in 0..tl.width {
+        let (start, end) = (tl.time(c as f64), tl.time(c as f64 + 1.0));
+        let (from, to) = (position(start), position(end));
+        let beat = grid.filter(|_| to > 0.0).and_then(|g| {
+            let first = g.beat_at(from).ceil();
+            (g.beat_time(first) < to).then_some(first.rem_euclid(f64::from(BEATS_PER_BAR)) == 0.0)
+        });
+        let on = heard(start);
+        let (glyph, color) = match beat {
+            _ if seam(start, end) => ('↺', LOOPING),
+            Some(true) => ('┃', if on { SUBTLE } else { DIM }),
+            Some(false) => (if down { '╷' } else { '╵' }, if on { DIM } else { FAINT }),
+            None => (' ', DIM),
+        };
+        spans.push(Span::styled(glyph.to_string(), Style::new().fg(color)));
+    }
+    Line::from(spans)
+}
+
+/// `left`, then `right` against the far edge if both fit in `width`.
+fn spread(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let used = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+    let gap = width.saturating_sub(used(&left) + used(&right));
+    if gap > 0 {
+        left.push(Span::raw(" ".repeat(gap)));
+        left.extend(right);
+    }
+    Line::from(left)
+}
+
+/// A song's name, where it leaves or enters, then its tempo and key on the right.
+fn song_label(name: &str, s: &SongInfo, cue: String, picked: bool, width: usize) -> Line<'static> {
+    let a = s.song.analysis.as_ref();
+    let mut left = vec![Span::styled(format!(" {name}  "), bold(text())), Span::styled(s.song.title.clone(), bold(text()))];
+    if !s.song.artist.is_empty() {
+        left.push(Span::styled(format!(" — {}", s.song.artist), subtle()));
+    }
+    left.push(Span::styled(format!("   {cue}"), if picked { bold(accent()) } else { dim() }));
+    let mut right = Vec::new();
+    if let Some(bpm) = a.and_then(|a| a.bpm()) {
+        right.push(Span::styled(format!("{bpm:.1} BPM"), subtle()));
+    }
+    if let Some(c) = theme::camelot(a) {
+        right.push(Span::styled(format!("  {c}"), Style::new().fg(camelot_color(c))));
+    }
+    right.push(Span::raw(" "));
+    spread(left, right, width)
+}
+
+/// Rows for each song's waveform out of `height`: even, so that it mirrors
+/// about a line between two rows.
+fn lane_rows(height: u16) -> usize {
+    let rows = (usize::from(height).saturating_sub(OTHER_ROWS) / 2).clamp(MIN_LANE_ROWS, MAX_LANE_ROWS);
+    rows - rows % 2
+}
+
+/// Draws the editor over `area`, noting what can be clicked in `hits`.
+pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<String, Arc<Vec<u8>>>, player: Option<&PlayerState>, hits: &mut Hits) {
+    let (Some(detail), Some(t)) = (&editor.detail, &editor.draft) else {
+        frame.render_widget(Paragraph::new(Line::styled("  Loading transition…", dim())), area);
+        return;
+    };
+    let full = usize::from(area.width);
+    let width = full.saturating_sub(4);
+    let (ga, gb) = (detail.from.song.analysis.as_ref().and_then(|a| a.grid), detail.to.song.analysis.as_ref().and_then(|a| a.grid));
+    let timing = t.timing(ga.as_ref(), gb.as_ref());
+    let looping = t.loop_map(ga.as_ref());
+    let rows = lane_rows(area.height);
+    let drawing = editor.drawing();
+    let focus = editor.field().lane();
+    let selected = |f: Field| editor.field() == f;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header: which transition, and how well the pair match.
+    let header = vec![
+        Span::styled(format!(" Transition {}/{}", editor.index + 1, editor.count.saturating_sub(1)), bold(accent())),
+        Span::styled(if t.auto { "   automatic" } else { "   edited" }, dim()),
+        Span::styled(if editor.modified() { "   [+] not saved, :w saves" } else { "" }, Style::new().fg(WARN)),
+        Span::styled(if editor.previewing { "   ▶ previewing" } else { "" }, accent()),
+    ];
+    let mut matching = crate::ui::compat_spans(&detail.compat);
+    matching.push(Span::raw(" "));
+    lines.push(spread(header, matching, full));
+    lines.push(Line::raw(""));
+
+    // The timeline: the window, and some of each song either side.
+    let pad = (timing.duration_ms * PAD).max(MIN_PAD_MS);
+    let ms_per_col = (timing.duration_ms + 2.0 * pad) / width.max(1) as f64;
+    let playhead = player.filter(|p| p.preview && editor.previewing).and_then(|p| preview_time(p, t, &timing));
+    let head_col = playhead.map(|ms| ((ms + pad) / ms_per_col) as isize);
+    let tl = Timeline { width, t0: -pad, ms_per_col, duration_ms: timing.duration_ms, head_col };
+
+    // A plays through its loop, if it has one; the repeats show dimmer.
+    let a_pos = |ms: f64| {
+        let at = t.out_ms + ms;
+        at + looping.as_ref().filter(|_| ms < timing.duration_ms).map_or(0.0, |m| m.offset(at))
+    };
+    let b_pos = |ms: f64| t.in_ms + ms * timing.rate;
+    let a_heard = |ms: f64| ms < timing.duration_ms && !looping.as_ref().is_some_and(|m| m.repeating(t.out_ms + ms));
+    let b_heard = |ms: f64| ms >= 0.0;
+    let a_seam = |from: f64, to: f64| {
+        to <= timing.duration_ms && looping.as_ref().is_some_and(|m| m.offset(t.out_ms + from) != m.offset(t.out_ms + to))
+    };
+    // The points of the curve being drawn, the one picked brightest.
+    let marks = |track: Track| -> Vec<Mark> {
+        let (Some(d), Some(points)) = (drawing, drawing.and_then(|d| t.curve(d.lane, track))) else { return Vec::new() };
+        let scale = Scale::of(t, d.lane, track);
+        let active = d.track == track;
+        let picked = active.then_some(d.point);
+        // The picked point first, so that it wins a cell it shares.
+        picked
+            .into_iter()
+            .chain((0..points.len()).filter(|&i| Some(i) != picked))
+            .filter_map(|i| {
+                let p = points.get(i)?;
+                let (glyph, style) = match (active, Some(i) == picked) {
+                    (true, true) => ("◆", bold(accent())),
+                    (true, false) => ("●", text()),
+                    (false, _) => ("●", dim()),
+                };
+                Some(Mark { x: p.x, height: scale.height(p.y), glyph, style })
+            })
+            .collect()
+    };
+    // A song's waveform: its curve to pick points from while drawing,
+    // otherwise its cue to drag.
+    let lane_hits = |hits: &mut Hits, first: usize, track: Track, cue: Target| {
+        let lane = mouse::rows(area, first, rows);
+        if drawing.is_some_and(|d| t.curve(d.lane, track).is_some()) {
+            let target = Target::Curve { track, t0: tl.t0, ms_per_col: tl.ms_per_col, duration_ms: tl.duration_ms };
+            hits.add(mouse::columns(lane, 2, width), target);
+        } else {
+            hits.add(lane, cue);
         }
-        let rows = mouse::columns(mouse::rows(area, first, PLOT_ROWS), 2, plot.width);
-        hits.add(rows, Target::Curve { track, t0: plot.t0, ms_per_col: plot.ms_per_col, duration_ms: plot.duration_ms });
+    };
+
+    // A over B, as in Spotify, their curves drawn over them.
+    let a_cue = Target::Lane(Field::Out, tl.ms_per_col);
+    let first = lines.len();
+    let cue = format!("leaves at {} · beat {}", clock_tenths(t.out_ms), beat_label(ga, t.out_ms));
+    lines.push(song_label("A", &detail.from, cue, selected(Field::Out), full));
+    lines.push(ruler(&tl, ga, &|ms| t.out_ms + ms, &a_heard, &a_seam, true));
+    hits.add(mouse::rows(area, first, 2), a_cue);
+    lane_hits(hits, lines.len(), Track::Out, a_cue);
+    let a_traces = traces(t, Track::Out, focus, drawing.is_some());
+    lines.extend(song_rows(&tl, waveforms.get(&detail.from.song.id), &a_pos, &a_heard, &a_traces, &marks(Track::Out), rows));
+
+    // Between them, the window's length under its middle.
+    let mut length = format!("{} · {:.1} s", bars(t.bars), timing.duration_ms / 1000.0);
+    if t.sync && (timing.rate - 1.0).abs() > 1e-6 {
+        length += &format!(" · B at {:.1}%", timing.rate * 100.0);
+    }
+    let middle = (timing.duration_ms / 2.0 - tl.t0) / tl.ms_per_col;
+    let from = (middle - length.chars().count() as f64 / 2.0).max(0.0) as usize;
+    let mut gap: Vec<Span> = vec![Span::raw(" "); width];
+    for (cell, c) in gap.iter_mut().skip(from).zip(length.chars()) {
+        *cell = Span::styled(c.to_string(), subtle());
+    }
+    if let Some(cell) = tl.head_col.and_then(|c| usize::try_from(c).ok()).and_then(|c| gap.get_mut(c)) {
+        *cell = Span::styled("│", text());
+    }
+    gap.insert(0, Span::raw("  "));
+    lines.push(Line::from(gap));
+
+    let b_cue = Target::Lane(Field::In, tl.ms_per_col * timing.rate);
+    lane_hits(hits, lines.len(), Track::In, b_cue);
+    let b_traces = traces(t, Track::In, focus, drawing.is_some());
+    lines.extend(song_rows(&tl, waveforms.get(&detail.to.song.id), &b_pos, &b_heard, &b_traces, &marks(Track::In), rows));
+    let first = lines.len();
+    lines.push(ruler(&tl, gb, &b_pos, &b_heard, &|_, _| false, false));
+    let cue = format!("enters at {} · beat {}", clock_tenths(t.in_ms), beat_label(gb, t.in_ms));
+    lines.push(song_label("B", &detail.to, cue, selected(Field::In), full));
+    hits.add(mouse::rows(area, first, 2), b_cue);
+    lines.push(Line::raw(""));
+
+    // Presets, as buttons.
+    let row = mouse::rows(area, lines.len(), 1);
+    let current = t.preset();
+    let mut presets = vec![Span::raw(" ")];
+    let mut button = |presets: &mut Vec<Span<'static>>, label: &str, on: bool, target: Option<Target>| {
+        let x: usize = presets.iter().map(Span::width).sum();
+        let label = format!(" {label} ");
+        if let Some(target) = target {
+            hits.add(mouse::columns(row, x, label.width()), target);
+        }
+        let style = if on { bold(Style::new().fg(PANEL).bg(TEXT)) } else { Style::new().fg(SUBTLE).bg(HIGHLIGHT) };
+        presets.push(Span::styled(label, style));
+        presets.push(Span::raw(" "));
+    };
+    if current.is_none() {
+        button(&mut presets, "Custom", true, None);
+    }
+    for (i, p) in Preset::ALL.iter().enumerate() {
+        button(&mut presets, p.label(), current == Some(*p), Some(Target::Preset(i)));
+    }
+    let x: usize = presets.iter().map(Span::width).sum();
+    hits.add(mouse::columns(row, x, " ✦ Auto ".width()), Target::Automatic);
+    presets.push(Span::styled(" ✦ Auto ", if t.auto { bold(Style::new().fg(PANEL).bg(GREEN)) } else { Style::new().fg(SUBTLE).bg(HIGHLIGHT) }));
+    lines.push(Line::from(presets));
+    lines.push(Line::raw(""));
+
+    // Fields, the curves' in their colours.
+    let value = |f: Field| -> String {
+        match f {
+            Field::Preset => t.preset_label().into(),
+            Field::Length => bars(t.bars),
+            Field::Sync => if t.sync { "on" } else { "off" }.into(),
+            Field::Out => clock_tenths(t.out_ms),
+            Field::In => clock_tenths(t.in_ms),
+            Field::Volume => t.volume.label().into(),
+            Field::Eq => t.eq.label().into(),
+            Field::Filter => t.filter.label().into(),
+            Field::Effect => t.effect.label().into(),
+            Field::Looping => t.looping.label().into(),
+        }
+    };
+    let name = |f: Field| match f {
+        Field::Preset => "Preset",
+        Field::Length => "Length",
+        Field::Sync => "Sync",
+        Field::Out => "A out",
+        Field::In => "B in",
+        Field::Volume => "Volume",
+        Field::Eq => "EQ",
+        Field::Filter => "Filter",
+        Field::Effect => "Effects",
+        Field::Looping => "Looping",
+    };
+    for r in 0..COLUMNS[0].len() {
+        let row = mouse::rows(area, lines.len(), 1);
+        let mut spans: Vec<Span> = Vec::new();
+        for (k, column) in COLUMNS.iter().enumerate() {
+            let f = column[r];
+            let x = if k == 0 { 1 } else { SECOND_COLUMN };
+            let used: usize = spans.iter().map(Span::width).sum();
+            spans.push(Span::raw(" ".repeat(x.saturating_sub(used).max(1))));
+            let x: usize = spans.iter().map(Span::width).sum();
+            let on = selected(f);
+            let marker = match f.lane() {
+                Some(lane) => Span::styled("▌ ", Style::new().fg(lane_color(lane))),
+                None if f == Field::Looping => Span::styled("↺ ", Style::new().fg(LOOPING)),
+                None => Span::raw("  "),
+            };
+            let label = Span::styled(format!("{:<9}", name(f)), if on { bold(text()) } else { subtle() });
+            let shown = Span::styled(if on { format!("‹ {} ›", value(f)) } else { format!("  {}  ", value(f)) }, if on { bold(accent()) } else { text() });
+            let lead = marker.width() + label.width();
+            hits.add(mouse::columns(row, x, if k == 0 { SECOND_COLUMN - x } else { full.saturating_sub(x) }), Target::Field(f));
+            if on {
+                // `‹ value ›`: each arrow and the space beside it.
+                hits.add(mouse::columns(row, x + lead, 2), Target::Step(f, -1));
+                hits.add(mouse::columns(row, (x + lead + shown.width()).saturating_sub(2), 2), Target::Step(f, 1));
+            }
+            spans.extend([marker, label, shown]);
+            if let Some(lane) = f.lane()
+                && !custom_on(t, lane).is_empty()
+            {
+                spans.push(Span::styled(format!("✎ {}", custom_on(t, lane)), Style::new().fg(lane_color(lane))));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::raw(""));
+
+    if let Some(d) = drawing {
+        lines.push(point_line(t, d));
+        lines.push(Line::styled(
+            " w/b point · h/l beat · H/L bar · ,/. nudge · j/k value · o add · x delete · s eased/straight · </> bend · Tab A/B · R style's curve · u undo · esc done",
+            dim(),
+        ));
+    } else {
+        lines.push(Line::styled(format!(" {}", field_note(t, editor.field(), &timing, ga.zip(gb).is_some())), subtle()));
+        lines.push(Line::styled(
+            " j/k field · h/l change · 1-9 preset · 0 auto · c draw curves · space preview · u undo · [ ] other transitions · :w save · esc close",
+            dim(),
+        ));
     }
 
-    lines.push(Line::raw(""));
-    if let Some(points) = t.curve(drawing.lane, drawing.track) {
-        let i = drawing.point.min(points.len() - 1);
-        let p = points[i];
-        let ends = if i == 0 || i + 1 == points.len() { " · ends move up and down only" } else { "" };
-        let segment = if i + 1 < points.len() {
-            format!(" · {} to the next{}", if p.linear { "straight" } else { "eased" }, if p.bend == 0.0 { String::new() } else { format!(", bent {:+.0}%", p.bend * 100.0) })
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} point {} of {}", track_name(drawing.track), i + 1, points.len()), bold(text())),
-            Span::styled(
-                format!(" · {:.0}% through · {:.0}% {}{segment}{ends}", p.x * 100.0, p.y * 100.0, measure(t, drawing.lane, drawing.track)),
-                subtle(),
-            ),
-        ]));
+    frame.render_widget(Paragraph::new(lines).style(Style::new().bg(PANEL)), area);
+}
+
+/// What the picked field does, and how to change it.
+fn field_note(t: &Transition, field: Field, timing: &vimj_core::transition::Timing, gridded: bool) -> String {
+    let cue_keys = "h/l beat · H/L bar · w/b phrase · ,/. 10 ms · or drag the waveform";
+    let curves = |lane: Lane, extra: &str| {
+        let custom = custom_on(t, lane);
+        let drawn = if custom.is_empty() { String::new() } else { format!("curve drawn by hand on {custom}") };
+        let has_curve = [Track::Out, Track::In].iter().any(|&k| t.curve(lane, k).is_some());
+        let hint = if has_curve { "c to draw your own" } else { "" };
+        [extra, &drawn, hint].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
+    };
+    match field {
+        Field::Preset => t.preset().map_or("Your own styles and curves", Preset::description).into(),
+        Field::Length => format!("{:.1} s · +/- from any field", timing.duration_ms / 1000.0),
+        Field::Sync => match (t.sync, gridded) {
+            (true, true) if (timing.rate - 1.0).abs() > 1e-6 => {
+                format!("B plays at {:.1}% to lock the beats, then eases back", timing.rate * 100.0)
+            }
+            (true, true) => "Same tempo, beats locked".into(),
+            (true, false) => "Needs both tempos".into(),
+            (false, _) => "Tempos left alone".into(),
+        },
+        Field::Out => format!("Where A starts handing over · {cue_keys}"),
+        Field::In => format!("Where B comes in · {cue_keys}"),
+        Field::Volume => curves(Lane::Volume, "Top is full volume"),
+        Field::Eq => curves(Lane::Eq, "Middle is flat, down cuts the bass; fainter lines are the mids and highs"),
+        Field::Filter => {
+            let way = |track: Track| {
+                let name = track_name(track);
+                t.filter.kind(track).map(|kind| match kind {
+                    FilterKind::LowPass => format!("{name}'s low-pass closes downwards"),
+                    FilterKind::HighPass => format!("{name}'s high-pass closes upwards"),
+                    FilterKind::Noise => format!("noise over {name} grows upwards"),
+                })
+            };
+            let ways: Vec<String> = [Track::Out, Track::In].into_iter().filter_map(way).collect();
+            let open = if ways.is_empty() { String::new() } else { format!("Open in the middle: {}", ways.join(", ")) };
+            curves(Lane::Filter, &open)
+        }
+        Field::Effect => {
+            let rings = match t.effect.kind() {
+                Some(_) if t.effect.rings_out() => "On A, rising with the send, and rings on after the window",
+                Some(_) => "On A, rising with the send, cut where the window ends",
+                None => "",
+            };
+            curves(Lane::Effect, rings)
+        }
+        Field::Looping => match t.looping {
+            Looping::None => "A plays straight through".into(),
+            Looping::Halving => "A repeats from the window's start, half as long each time (↺ on its beats)".into(),
+            _ => "A repeats from the window's start until B takes over (↺ on its beats)".into(),
+        },
     }
-    lines.push(Line::styled(
-        " w/b point · h/l beat · H/L bar · ,/. nudge · j/k value · o add · x delete · s eased/straight · </> bend · Tab A/B · R style's curve · u undo · esc done",
-        dim(),
-    ));
+}
+
+/// The point picked on the curve being drawn.
+fn point_line(t: &Transition, d: Drawing) -> Line<'static> {
+    let head = Span::styled(format!(" Drawing {} on {}", d.lane.label(), track_name(d.track)), bold(Style::new().fg(lane_color(d.lane))));
+    let Some(points) = t.curve(d.lane, d.track) else { return Line::from(head) };
+    let i = d.point.min(points.len() - 1);
+    let p = points[i];
+    let ends = if i == 0 || i + 1 == points.len() { " · ends move up and down only" } else { "" };
+    let segment = if i + 1 < points.len() {
+        let bend = if p.bend == 0.0 { String::new() } else { format!(", bent {:+.0}%", p.bend * 100.0) };
+        format!(" · {} to the next{bend}", if p.linear { "straight" } else { "eased" })
+    } else {
+        String::new()
+    };
+    let custom = if t.is_custom(d.lane, d.track) { "drawn by hand".to_owned() } else { format!("{}'s curve", style_name(t, d.lane)) };
+    Line::from(vec![
+        head,
+        Span::styled(format!(" · {custom} · point {} of {}", i + 1, points.len()), bold(text())),
+        Span::styled(format!(" · {:.0}% through · {:.0}% {}{segment}{ends}", p.x * 100.0, p.y * 100.0, measure(t, d.lane, d.track)), subtle()),
+    ])
 }
 
 /// The style that drew a lane's curves.
@@ -1033,27 +1281,6 @@ fn style_name(t: &Transition, lane: Lane) -> &'static str {
         Lane::Eq => t.eq.label(),
         Lane::Filter => t.filter.label(),
         Lane::Effect => t.effect.label(),
-    }
-}
-
-/// One cell showing two levels: the upper half for A, the lower for B.
-fn two_levels(a: f32, b: f32) -> Span<'static> {
-    let (a_on, b_on) = (a >= 0.5, b >= 0.5);
-    let shade = |v: f32, color: Color| {
-        let level = 0.25 + 0.75 * v;
-        match color {
-            Color::Rgb(r, g, bl) => Color::Rgb((f32::from(r) * level) as u8, (f32::from(g) * level) as u8, (f32::from(bl) * level) as u8),
-            c => c,
-        }
-    };
-    match (a_on, b_on) {
-        (true, true) => Span::styled("█", Style::new().fg(TEXT)),
-        (true, false) => Span::styled("▀", Style::new().fg(shade(a, GREEN)).bg(if b > 0.05 { shade(b, PURPLE) } else { PANEL })),
-        (false, true) => Span::styled("▄", Style::new().fg(shade(b, PURPLE)).bg(if a > 0.05 { shade(a, GREEN) } else { PANEL })),
-        (false, false) => {
-            let glyph = if a > 0.05 || b > 0.05 { "·" } else { " " };
-            Span::styled(glyph, Style::new().fg(DIM))
-        }
     }
 }
 
@@ -1284,11 +1511,12 @@ mod tests {
         let mut ed = editor();
         ed.pick_field(Field::Eq);
         ed.customize();
-        // Blend's bass on A: full until 60%, gone at the end.
+        // Blend's bass on A: full until 60%, gone at the end. EQ sits in the
+        // lane's lower half, so a height is half the value.
         assert!(ed.click_curve(Track::Out, 0.58, 0.03, false));
         assert_eq!(ed.drawing().unwrap().point, 1);
-        ed.drag_point(0.3, 0.9, 0.0);
-        ed.drag_point(0.49, 0.2, 0.02);
+        ed.drag_point(Track::Out, 0.3, 0.45, 0.0);
+        ed.drag_point(Track::Out, 0.49, 0.1, 0.02);
         let p = ed.points().unwrap()[1];
         assert!((p.x - 0.5).abs() < 1e-6 && (p.y - 0.2).abs() < 1e-6, "snapped to the middle: {p:?}");
         // One drag, one undo step.
@@ -1302,10 +1530,60 @@ mod tests {
         press(&mut ed, "0j");
         let lowered = ed.points().unwrap()[0].y;
         assert!(ed.click_curve(Track::Out, 0.0, 0.03, false));
-        ed.drag_point(0.01, lowered, 0.0);
-        ed.drag_point(0.01, 0.4, 0.0);
+        ed.drag_point(Track::Out, 0.01, lowered / 2.0, 0.0);
+        ed.drag_point(Track::Out, 0.01, 0.2, 0.0);
         press(&mut ed, "u");
         assert_eq!(ed.points().unwrap()[0].y, lowered, "back to before the drag, not before the j");
+    }
+
+    #[test]
+    fn a_drag_follows_the_curve_it_started_on() {
+        let mut ed = editor();
+        // Rise: a high-pass closing on A, a low-pass opening on B.
+        ed.preset(Preset::Rise);
+        ed.pick_field(Field::Filter);
+        ed.customize();
+        assert!(ed.click_curve(Track::Out, 1.0, 0.03, false));
+        // Tab with the button held: the drag is over A's lane, and moves nothing on B.
+        ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let before = ed.draft.clone();
+        ed.drag_point(Track::Out, 1.0, 1.0, 0.0);
+        assert_eq!(ed.draft, before);
+        // A drag on B's low-pass goes the way it's drawn: down closes it.
+        assert!(ed.click_curve(Track::In, 0.0, 0.03, false));
+        ed.drag_point(Track::In, 0.0, 0.0, 0.0);
+        assert_eq!(ed.points().unwrap()[0].y, 1.0);
+    }
+
+    #[test]
+    fn keys_move_a_point_up_and_down_the_lane() {
+        let mut ed = editor();
+        // Rise: a high-pass closing on A, which closes upwards, and a
+        // low-pass opening on B, which closes downwards.
+        ed.preset(Preset::Rise);
+        ed.pick_field(Field::Filter);
+        press(&mut ed, "c$k");
+        assert!((ed.points().unwrap()[1].y - 0.85).abs() < 1e-6, "A's high-pass closes further");
+        ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        press(&mut ed, "0k");
+        assert!((ed.points().unwrap()[0].y - 0.75).abs() < 1e-6, "B's low-pass opens further");
+        press(&mut ed, "J");
+        assert!((ed.points().unwrap()[0].y - 1.0).abs() < 1e-6, "and closes going down");
+    }
+
+    #[test]
+    fn draws_in_any_size_of_terminal() {
+        let mut ed = editor();
+        for drawing in [false, true] {
+            if drawing {
+                ed.pick_field(Field::Volume);
+                ed.customize();
+            }
+            for (width, height) in [(0, 0), (10, 40), (29, 40), (100, 12), (160, 46)] {
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| draw(f, f.area(), &ed, &HashMap::new(), None, &mut Hits::default())).unwrap();
+            }
+        }
     }
 
     #[test]

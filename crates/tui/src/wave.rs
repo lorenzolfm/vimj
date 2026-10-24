@@ -11,11 +11,15 @@ const STRIDE: usize = 4;
 pub struct Column {
     /// 0..=1.
     pub peak: f32,
+    /// The peaks' mean, 0..=1: how loud the span is on the whole, which
+    /// keeps a loud master from drawing as a solid block.
+    pub level: f32,
     /// Low, mid, high, 0..=1.
     pub bands: [f32; 3],
 }
 
-/// The loudest moment in `[from_ms, to_ms)`, or `None` outside the song.
+/// The loudest moment in `[from_ms, to_ms)`, and the level through it, or
+/// `None` outside the song.
 pub fn column(wave: &[u8], from_ms: f64, to_ms: f64) -> Option<Column> {
     let count = wave.len() / STRIDE;
     let index = |ms: f64| (ms / 1000.0 * WAVEFORM_HZ).floor();
@@ -27,19 +31,22 @@ pub fn column(wave: &[u8], from_ms: f64, to_ms: f64) -> Option<Column> {
     let mut col = Column::default();
     for chunk in wave[lo * STRIDE..hi * STRIDE].as_chunks::<STRIDE>().0 {
         col.peak = col.peak.max(f32::from(chunk[0]) / 255.0);
+        col.level += f32::from(chunk[0]) / 255.0;
         for (b, &v) in col.bands.iter_mut().zip(&chunk[1..]) {
             *b = b.max(f32::from(v) / 255.0);
         }
     }
+    col.level /= (hi - lo) as f32;
     Some(col)
 }
 
-/// Bass-heavy columns lean blue, bright ones lean towards white, like a DJ waveform.
-pub fn color(col: Column, lit: bool) -> Color {
+/// Bass-heavy columns lean blue, bright ones lean towards orange, like a DJ
+/// waveform. Kept dark, so that the curves drawn over it stand out.
+pub fn color(col: Column, heard: bool) -> Color {
     let [low, mid, high] = col.bands;
     let total = (low + mid + high).max(1e-3);
     let hue = 210.0 - 170.0 * ((mid + high * 1.5) / (total * 1.5)).clamp(0.0, 1.0);
-    if lit { theme::hsl(hue, 0.75, 0.62) } else { theme::hsl(hue, 0.25, 0.32) }
+    if heard { theme::hsl(hue, 0.35, 0.36) } else { theme::hsl(hue, 0.15, 0.2) }
 }
 
 #[cfg(test)]
@@ -52,6 +59,7 @@ mod tests {
         let wave = [10, 0, 0, 0, 255, 255, 0, 0, 20, 0, 0, 255];
         let c = column(&wave, 0.0, 30.0).unwrap();
         assert_eq!(c.peak, 1.0);
+        assert!((c.level - 285.0 / 765.0).abs() < 1e-6);
         assert_eq!(c.bands, [1.0, 0.0, 1.0]);
         assert_eq!(column(&wave, 20.0, 21.0).unwrap().peak, 20.0 / 255.0);
         assert_eq!(column(&wave, 40.0, 50.0), None);
