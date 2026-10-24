@@ -141,7 +141,7 @@ late`, or, with sync off, how far B drifts by the window's end.
 | `u` `C-r` | undo, redo |
 | `space` | loop the transition while you edit; it plays your edits before you save them |
 | `[` `]` | previous / next transition in the playlist |
-| `:w` | save; `[+]` in the header means there are edits to save |
+| `:w` | save; `[+]` in the header means there are edits to save. If another vimj saved this transition since you opened it, `:w` says so and keeps your edits: `:w` again replaces theirs, `:e!` takes theirs |
 | `:wq` `:x` | save and close |
 | `Esc` `q` `:q` | close; with unsaved edits it asks you to `:w` or `:q!` first |
 | `:q!`, `:e!` | close throwing the edits away; throw them away and keep editing |
@@ -210,13 +210,16 @@ crates/tui     vimj        ratatui frontend
 Frontends talk to `vimjd` over HTTP on `127.0.0.1:8787`; `vimj_core::protocol` has the requests,
 responses and the events streamed from `GET /api/events`, so a web or desktop frontend can reuse it.
 `GET /api/status` names the `protocol` the daemon speaks (`vimj_core::protocol::PROTOCOL`); talk
-only to a daemon whose protocol is your own.
+only to a daemon whose protocol is your own. A transition says where it comes from, `source`, and
+`PUT` or `DELETE` on it names the source last read as `base`: a write over an edit its writer
+hasn't seen is refused with `409 Conflict`.
 
 State lives in `~/.config/vimj/config.toml` (music folder, tool paths, browser for cookies, volume)
 and `~/.local/share/vimj/` (the library, waveforms, `vimjd.log`). If `vimjd` can't read the library,
-say one a newer vimj wrote, it stops and says why in `vimjd.log` rather than start over empty. Older
-builds don't check, so before `vimjd` first saves a library from an older vimj it keeps a copy as it
-was, `library.v0.json`: put that back as `library.json` before running an older build.
+say one a newer vimj wrote, it stops and says why in `vimjd.log` rather than start over empty. Before
+`vimjd` first saves a library from an older vimj it keeps a copy as it was, named for its format
+(`library.v0.json`, `library.v1.json`): put that back as `library.json` before running that older
+build. Edits made since stay behind.
 
 `cargo run --release -p vimj-audio --example analyze -- FILE…` prints what analysis finds in files;
 `--example render -- FROM TO OUT.wav [PRESET] [BARS]` renders a transition to listen to. `vimjd

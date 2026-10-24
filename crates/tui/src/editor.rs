@@ -12,8 +12,8 @@ use crate::wave;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use vimj_core::curve::{self, Curve, Point};
 use vimj_core::model::{BEATS_PER_BAR, Grid};
-use vimj_core::protocol::{PlayerState, SongInfo, TransitionDetail};
-use vimj_core::transition::{BAR_CHOICES, Effect, Eq, Filter, FilterKind, Lane, Lock, Looping, Preset, Side, Track, Transition, Volume};
+use vimj_core::protocol::{PlayerState, SongInfo, Source, TransitionDetail};
+use vimj_core::transition::{Effect, Eq, Filter, FilterKind, Lane, Lock, Looping, Preset, Side, Track, Transition, Volume};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -95,6 +95,31 @@ enum Mode {
     Drawing(Drawing),
 }
 
+/// The transition being edited, and what `:w` does with it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Draft {
+    /// Forgets the pair's edit, back to the transition vimj picks, shown.
+    Automatic(Transition),
+    /// Stores this as the pair's edit.
+    Edited(Transition),
+}
+
+impl Draft {
+    /// The pair as `detail` has it stored.
+    fn of(detail: &TransitionDetail) -> Draft {
+        match detail.source {
+            Source::Automatic => Draft::Automatic(detail.transition.clone()),
+            Source::Edited { .. } => Draft::Edited(detail.transition.clone()),
+        }
+    }
+
+    pub fn transition(&self) -> &Transition {
+        match self {
+            Draft::Automatic(t) | Draft::Edited(t) => t,
+        }
+    }
+}
+
 pub struct Editor {
     /// The pair is `songs[index]` → `songs[index + 1]`.
     pub index: usize,
@@ -103,15 +128,14 @@ pub struct Editor {
     to: String,
     /// The pair as stored.
     pub detail: Option<TransitionDetail>,
-    /// The transition being edited, which `:w` stores.
-    pub draft: Option<Transition>,
+    pub draft: Option<Draft>,
     mode: Mode,
     /// Drafts before each edit, and those `u` stepped back over.
-    undo: Vec<Transition>,
-    redo: Vec<Transition>,
+    undo: Vec<Draft>,
+    redo: Vec<Draft>,
     /// The draft as a mouse drag of a curve point found it, until the drag
     /// changes it: that is then the drag's one undo step.
-    drag_from: Option<Transition>,
+    drag_from: Option<Draft>,
     /// When the draft last changed, until a running preview hears of it.
     changed_at: Option<Instant>,
     /// The last edit moved the window, so a running preview should start over.
@@ -179,58 +203,67 @@ impl Editor {
         detail.from.song.id == self.from && detail.to.song.id == self.to
     }
 
+    /// The transition being edited.
+    pub fn transition(&self) -> Option<&Transition> {
+        self.draft.as_ref().map(Draft::transition)
+    }
+
+    /// The pair as stored, as first read or read again since: a draft
+    /// edited meanwhile stays, to be compared with this.
     pub fn loaded(&mut self, detail: TransitionDetail) {
         if !self.is_pair(&detail) {
             return;
         }
         if self.draft.is_none() {
-            self.draft = Some(detail.transition.clone());
+            self.draft = Some(Draft::of(&detail));
         }
         self.detail = Some(detail);
     }
 
     /// `sent` was stored as `detail`. The draft takes on what the daemon
     /// made of it, unless it has been edited again since.
-    pub fn saved(&mut self, detail: TransitionDetail, sent: &Transition) {
+    pub fn saved(&mut self, detail: TransitionDetail, sent: &Draft) {
         if !self.is_pair(&detail) {
             return;
         }
         if self.draft.as_ref() == Some(sent) {
-            self.draft = Some(detail.transition.clone());
+            self.draft = Some(Draft::of(&detail));
         }
         self.detail = Some(detail);
     }
 
     /// The draft differs from what is stored.
     pub fn modified(&self) -> bool {
-        matches!((&self.detail, &self.draft), (Some(d), Some(t)) if d.transition != *t)
+        let (Some(d), Some(draft)) = (&self.detail, &self.draft) else { return false };
+        let same_source = matches!((d.source, draft), (Source::Automatic, Draft::Automatic(_)) | (Source::Edited { .. }, Draft::Edited(_)));
+        !same_source || d.transition != *draft.transition()
     }
 
     /// Throws the edits away.
     pub fn revert(&mut self) {
         if let Some(d) = &self.detail {
-            self.replace(d.transition.clone());
+            self.replace(Draft::of(d));
         }
     }
 
     /// Goes back to the transition vimj would pick by itself.
     pub fn reset(&mut self) {
         if let Some(d) = &self.detail {
-            self.replace(d.automatic.clone());
+            self.replace(Draft::Automatic(d.automatic.clone()));
         }
     }
 
-    fn replace(&mut self, t: Transition) {
-        if self.draft.as_ref() == Some(&t) {
+    fn replace(&mut self, draft: Draft) {
+        if self.draft.as_ref() == Some(&draft) {
             return;
         }
-        if let Some(before) = self.draft.replace(t) {
+        if let Some(before) = self.draft.replace(draft) {
             self.remember(before);
         }
         self.changed(true);
     }
 
-    fn remember(&mut self, before: Transition) {
+    fn remember(&mut self, before: Draft) {
         self.undo.push(before);
         if self.undo.len() > HISTORY {
             self.undo.remove(0);
@@ -262,7 +295,7 @@ impl Editor {
 
     /// Starts previewing; returns what to play.
     pub fn start_preview(&mut self) -> Option<Transition> {
-        let t = self.draft.clone()?;
+        let t = self.transition()?.clone();
         self.previewing = true;
         self.changed_at = None;
         self.restart_preview = false;
@@ -276,7 +309,7 @@ impl Editor {
             return None;
         }
         self.changed_at = None;
-        Some((self.draft.clone()?, std::mem::take(&mut self.restart_preview)))
+        Some((self.transition()?.clone(), std::mem::take(&mut self.restart_preview)))
     }
 
     fn grids(&self) -> (Option<Grid>, Option<Grid>) {
@@ -365,17 +398,17 @@ impl Editor {
     }
 
     /// Applies an edit to the draft; `record` gives it its own undo step.
+    /// One that changes nothing leaves an automatic draft automatic.
     fn edit_with(&mut self, moves_window: bool, record: bool, f: impl FnOnce(&mut Transition)) {
-        let (Some(t), Some(d)) = (&self.draft, &self.detail) else { return };
+        let (Some(t), Some(d)) = (self.transition(), &self.detail) else { return };
         let mut after = t.clone();
         f(&mut after);
-        after.auto = false;
         // Kept within both songs, as the daemon keeps what it stores.
         after.clamp(side(&d.from), side(&d.to));
-        if (Transition { auto: t.auto, ..after.clone() }) == *t {
+        if after == *t {
             return;
         }
-        let before = self.draft.replace(after).expect("checked above");
+        let before = self.draft.replace(Draft::Edited(after)).expect("checked above");
         if record {
             self.remember(before);
         }
@@ -395,17 +428,14 @@ impl Editor {
                 let at = t.preset().and_then(|p| Preset::ALL.iter().position(|q| *q == p)).map_or(0, |i| i as i32 + by);
                 t.set_preset(Preset::ALL[at.rem_euclid(Preset::ALL.len() as i32) as usize]);
             }),
-            Field::Length => self.edit(true, |t| {
-                let at = BAR_CHOICES.iter().position(|b| *b >= t.bars).unwrap_or(BAR_CHOICES.len() - 1) as i32;
-                t.bars = BAR_CHOICES[(at + by).clamp(0, BAR_CHOICES.len() as i32 - 1) as usize];
-            }),
+            Field::Length => self.edit(true, |t| t.bars = t.bars.step(by)),
             Field::Sync => self.edit(true, |t| t.sync = !t.sync),
             Field::Out => self.edit(true, |t| t.out_ms = (t.out_ms + step(a)).max(0.0)),
             Field::In => self.edit(true, |t| t.in_ms = (t.in_ms + step(b)).max(0.0)),
-            Field::Volume => self.edit(false, |t| t.set_volume(cycle(&Volume::ALL, t.volume, by))),
-            Field::Eq => self.edit(false, |t| t.set_eq(cycle(&Eq::ALL, t.eq, by))),
-            Field::Filter => self.edit(false, |t| t.set_filter(cycle(&Filter::ALL, t.filter, by))),
-            Field::Effect => self.edit(false, |t| t.set_effect(cycle(&Effect::ALL, t.effect, by))),
+            Field::Volume => self.edit(false, |t| t.set_volume(cycle(&Volume::ALL, t.styles().volume, by))),
+            Field::Eq => self.edit(false, |t| t.set_eq(cycle(&Eq::ALL, t.styles().eq, by))),
+            Field::Filter => self.edit(false, |t| t.set_filter(cycle(&Filter::ALL, t.styles().filter, by))),
+            Field::Effect => self.edit(false, |t| t.set_effect(cycle(&Effect::ALL, t.styles().effect, by))),
             Field::Looping => self.edit(false, |t| t.looping = cycle(&Looping::ALL, t.looping, by)),
         }
     }
@@ -419,7 +449,7 @@ impl Editor {
 
     /// Where A leaves or B enters.
     pub fn cue(&self, field: Field) -> Option<f64> {
-        let t = self.draft.as_ref()?;
+        let t = self.transition()?;
         match field {
             Field::Out => Some(t.out_ms),
             Field::In => Some(t.in_ms),
@@ -453,7 +483,7 @@ impl Editor {
     }
 
     pub fn draw_lane(&mut self, lane: Lane) -> Action {
-        let Some(t) = &self.draft else { return Action::None };
+        let Some(t) = self.transition() else { return Action::None };
         let Some(track) = [Track::Out, Track::In].into_iter().find(|&k| t.curve(lane, k).is_some()) else {
             return Action::Error(format!("{} is None, so there is no curve to draw: pick a style first", lane.label()));
         };
@@ -464,12 +494,12 @@ impl Editor {
     /// The curve being drawn.
     pub fn points(&self) -> Option<&[Point]> {
         let d = self.drawing()?;
-        self.draft.as_ref()?.curve(d.lane, d.track)
+        self.transition()?.curve(d.lane, d.track)
     }
 
     /// Keeps the drawing on a curve that exists, after the draft changed under it.
     fn fit_drawing(&mut self) {
-        let (Mode::Drawing(mut d), Some(t)) = (self.mode, &self.draft) else { return };
+        let (Mode::Drawing(mut d), Some(t)) = (self.mode, self.transition()) else { return };
         if t.curve(d.lane, d.track).is_none() {
             d.track = if d.track == Track::Out { Track::In } else { Track::Out };
         }
@@ -480,7 +510,7 @@ impl Editor {
     }
 
     fn switch_track(&mut self) {
-        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
+        let (Some(d), Some(t)) = (self.drawing(), self.transition()) else { return };
         let other = if d.track == Track::Out { Track::In } else { Track::Out };
         if t.curve(d.lane, other).is_some() {
             self.mode = Mode::Drawing(Drawing { track: other, ..d });
@@ -515,7 +545,7 @@ impl Editor {
     }
 
     fn window_beats(&self) -> f32 {
-        self.draft.as_ref().map_or(16.0, |t| (t.bars * BEATS_PER_BAR) as f32)
+        self.transition().map_or(16.0, |t| (t.bars.count() * BEATS_PER_BAR) as f32)
     }
 
     /// Moves the point by whole beats, landing on the beat.
@@ -537,7 +567,7 @@ impl Editor {
     /// Moves the point `by` up the lane as it is drawn, which lowers the
     /// value of a low-pass, as that closes downwards.
     fn raise(&mut self, by: f32) {
-        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
+        let (Some(d), Some(t)) = (self.drawing(), self.transition()) else { return };
         let dy = by * Scale::of(t, d.lane, d.track).up();
         self.move_point(0.0, dy);
     }
@@ -570,7 +600,7 @@ impl Editor {
     pub fn click_curve(&mut self, track: Track, x: f32, reach: f32, double: bool) -> bool {
         let Some(d) = self.drawing() else { return false };
         if d.track != track {
-            if self.draft.as_ref().and_then(|t| t.curve(d.lane, track)).is_none() {
+            if self.transition().and_then(|t| t.curve(d.lane, track)).is_none() {
                 return false;
             }
             self.mode = Mode::Drawing(Drawing { track, point: 0, ..d });
@@ -596,7 +626,7 @@ impl Editor {
     /// drag is one undo step. Once a key has moved the drawing to the other
     /// song, the drag moves nothing.
     pub fn drag_point(&mut self, track: Track, x: f32, height: f32, snap: f32) {
-        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
+        let (Some(d), Some(t)) = (self.drawing(), self.transition()) else { return };
         if d.track != track {
             return;
         }
@@ -635,12 +665,12 @@ fn measure(t: &Transition, lane: Lane, track: Track) -> &'static str {
     match lane {
         Lane::Volume => "volume",
         Lane::Eq => "bass",
-        Lane::Filter => match t.filter.kind(track) {
+        Lane::Filter => match t.styles().filter.kind(track) {
             Some(FilterKind::LowPass) => "low-pass closed",
             Some(FilterKind::HighPass) => "high-pass closed",
             Some(FilterKind::Noise) | None => "noise",
         },
-        Lane::Effect => match t.effect.kind() {
+        Lane::Effect => match t.styles().effect.kind() {
             Some(vimj_core::transition::EffectKind::Reverb) => "reverb send",
             Some(_) | None => "echo send",
         },
@@ -710,7 +740,7 @@ impl Scale {
         match lane {
             Lane::Volume | Lane::Effect => Scale { zero: 0.0, one: 1.0 },
             Lane::Eq => Scale { zero: 0.0, one: 0.5 },
-            Lane::Filter => match t.filter.kind(track) {
+            Lane::Filter => match t.styles().filter.kind(track) {
                 Some(FilterKind::LowPass) => Scale { zero: 0.5, one: 0.0 },
                 // A song the filter leaves alone has no curve to place.
                 Some(FilterKind::HighPass | FilterKind::Noise) | None => Scale { zero: 0.5, one: 1.0 },
@@ -1029,10 +1059,12 @@ fn lane_rows(height: u16) -> usize {
 
 /// Draws the editor over `area`, noting what can be clicked in `hits`.
 pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<String, Arc<Vec<u8>>>, player: Option<&PlayerState>, hits: &mut Hits) {
-    let (Some(detail), Some(t)) = (&editor.detail, &editor.draft) else {
+    let (Some(detail), Some(draft)) = (&editor.detail, &editor.draft) else {
         frame.render_widget(Paragraph::new(Line::styled("  Loading transition…", dim())), area);
         return;
     };
+    let t = draft.transition();
+    let automatic = matches!(draft, Draft::Automatic(_));
     let full = usize::from(area.width);
     let width = full.saturating_sub(4);
     let (ga, gb) = (detail.from.song.analysis.as_ref().and_then(|a| a.grid), detail.to.song.analysis.as_ref().and_then(|a| a.grid));
@@ -1047,7 +1079,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     // Header: which transition, and how well the pair match.
     let header = vec![
         Span::styled(format!(" Transition {}/{}", editor.index + 1, editor.count.saturating_sub(1)), bold(accent())),
-        Span::styled(if t.auto { "   automatic" } else { "   edited" }, dim()),
+        Span::styled(if automatic { "   automatic" } else { "   edited" }, dim()),
         Span::styled(if editor.modified() { "   [+] not saved, :w saves" } else { "" }, Style::new().fg(WARN)),
         Span::styled(if editor.previewing { "   ▶ previewing" } else { "" }, accent()),
     ];
@@ -1174,7 +1206,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     }
     let x: usize = presets.iter().map(Span::width).sum();
     hits.add(mouse::columns(row, x, " ✦ Auto ".width()), Target::Automatic);
-    presets.push(Span::styled(" ✦ Auto ", if t.auto { bold(Style::new().fg(PANEL).bg(GREEN)) } else { Style::new().fg(SUBTLE).bg(HIGHLIGHT) }));
+    presets.push(Span::styled(" ✦ Auto ", if automatic { bold(Style::new().fg(PANEL).bg(GREEN)) } else { Style::new().fg(SUBTLE).bg(HIGHLIGHT) }));
     lines.push(Line::from(presets));
     lines.push(Line::raw(""));
 
@@ -1186,10 +1218,10 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
             Field::Sync => if t.sync { "on" } else { "off" }.into(),
             Field::Out => clock_tenths(t.out_ms),
             Field::In => clock_tenths(t.in_ms),
-            Field::Volume => t.volume.label().into(),
-            Field::Eq => t.eq.label().into(),
-            Field::Filter => t.filter.label().into(),
-            Field::Effect => t.effect.label().into(),
+            Field::Volume => t.styles().volume.label().into(),
+            Field::Eq => t.styles().eq.label().into(),
+            Field::Filter => t.styles().filter.label().into(),
+            Field::Effect => t.styles().effect.label().into(),
             Field::Looping => t.looping.label().into(),
         }
     };
@@ -1286,7 +1318,7 @@ fn field_note(t: &Transition, field: Field, timing: &vimj_core::transition::Timi
         Field::Filter => {
             let way = |track: Track| {
                 let name = track_name(track);
-                t.filter.kind(track).map(|kind| match kind {
+                t.styles().filter.kind(track).map(|kind| match kind {
                     FilterKind::LowPass => format!("{name}'s low-pass closes downwards"),
                     FilterKind::HighPass => format!("{name}'s high-pass closes upwards"),
                     FilterKind::Noise => format!("noise over {name} grows upwards"),
@@ -1297,8 +1329,9 @@ fn field_note(t: &Transition, field: Field, timing: &vimj_core::transition::Timi
             curves(Lane::Filter, &open)
         }
         Field::Effect => {
-            let rings = match t.effect.kind() {
-                Some(_) if t.effect.rings_out() => "On A, rising with the send, and rings on after the window",
+            let effect = t.styles().effect;
+            let rings = match effect.kind() {
+                Some(_) if effect.rings_out() => "On A, rising with the send, and rings on after the window",
                 Some(_) => "On A, rising with the send, cut where the window ends",
                 None => "",
             };
@@ -1336,10 +1369,10 @@ fn point_line(t: &Transition, d: Drawing) -> Line<'static> {
 /// The style that drew a lane's curves.
 fn style_name(t: &Transition, lane: Lane) -> &'static str {
     match lane {
-        Lane::Volume => t.volume.label(),
-        Lane::Eq => t.eq.label(),
-        Lane::Filter => t.filter.label(),
-        Lane::Effect => t.effect.label(),
+        Lane::Volume => t.styles().volume.label(),
+        Lane::Eq => t.styles().eq.label(),
+        Lane::Filter => t.styles().filter.label(),
+        Lane::Effect => t.styles().effect.label(),
     }
 }
 
@@ -1414,7 +1447,7 @@ mod tests {
         let compat = vimj_core::compat::compat(from.song.analysis.as_ref(), to.song.analysis.as_ref());
         let automatic = vimj_core::transition::auto_transition(side(&from), side(&to), &compat);
         let grid = Some(Grid { bpm: 120.0, downbeat_ms: 0.0 });
-        TransitionDetail { timing: automatic.timing(grid.as_ref(), grid.as_ref()), transition: automatic.clone(), saved: false, automatic, compat, from, to }
+        TransitionDetail { timing: automatic.timing(grid.as_ref(), grid.as_ref()), transition: automatic.clone(), source: Source::Automatic, automatic, compat, from, to }
     }
 
     fn editor() -> Editor {
@@ -1423,9 +1456,9 @@ mod tests {
         ed
     }
 
-    /// The daemon's answer to `:w`.
-    fn stored(t: &Transition) -> TransitionDetail {
-        TransitionDetail { transition: t.clone(), saved: true, ..pair("a", "b") }
+    /// The daemon's answer to `:w`, at revision `rev`.
+    fn stored(t: &Transition, rev: u64) -> TransitionDetail {
+        TransitionDetail { transition: t.clone(), source: Source::Edited { rev }, ..pair("a", "b") }
     }
 
     fn press(ed: &mut Editor, keys: &str) {
@@ -1448,24 +1481,46 @@ mod tests {
         let sent = ed.draft.clone().unwrap();
         ed.change(Field::Eq, 1, false);
         // Storing what was sent leaves the edit made since unsaved.
-        ed.saved(stored(&sent), &sent);
+        ed.saved(stored(sent.transition(), 1), &sent);
         assert!(ed.modified());
 
         // The draft takes on whatever the daemon stored for it.
         let sent = ed.draft.clone().unwrap();
-        let mut kept = sent.clone();
+        let mut kept = sent.transition().clone();
         kept.in_ms += 1.0;
-        ed.saved(stored(&kept), &sent);
-        assert_eq!(ed.draft.as_ref(), Some(&kept));
+        ed.saved(stored(&kept, 2), &sent);
+        assert_eq!(ed.transition(), Some(&kept));
         assert!(!ed.modified());
 
         // Going back to automatic is an edit to write too; :e! undoes it.
+        let automatic = pair("a", "b").automatic;
         ed.reset();
-        assert_eq!(ed.draft.as_ref(), Some(&pair("a", "b").automatic));
+        assert_eq!(ed.draft, Some(Draft::Automatic(automatic.clone())));
         assert!(ed.modified());
         ed.revert();
-        assert_eq!(ed.draft.as_ref(), Some(&kept));
+        assert_eq!(ed.draft, Some(Draft::Edited(kept)));
         assert!(!ed.modified());
+
+        // Even over an edit that sounds the same as the automatic one.
+        let sent = ed.draft.clone().unwrap();
+        ed.saved(stored(&automatic, 3), &sent);
+        ed.reset();
+        assert!(ed.modified(), "forgetting the edit is still to be written");
+    }
+
+    #[test]
+    fn edits_stay_against_a_pair_read_again() {
+        let mut ed = editor();
+        ed.change(Field::Volume, 1, false);
+        let mine = ed.draft.clone();
+        // Another frontend stored its own edit; :w was refused and the pair read again.
+        let theirs = pair("a", "b").automatic;
+        ed.loaded(stored(&theirs, 7));
+        assert_eq!(ed.draft, mine, "the edits stay");
+        assert_eq!(ed.detail.as_ref().map(|d| d.source), Some(Source::Edited { rev: 7 }), "to be written over theirs");
+        assert!(ed.modified());
+        ed.revert();
+        assert_eq!(ed.draft, Some(Draft::Edited(theirs)), ":e! takes theirs");
     }
 
     #[test]
@@ -1475,7 +1530,7 @@ mod tests {
         ed.change(Field::Filter, 1, false);
         let filtered = ed.draft.clone().unwrap();
         ed.change(Field::Looping, 1, false);
-        assert_eq!(ed.draft.as_ref().unwrap().looping, Looping::OneBeat);
+        assert_eq!(ed.transition().unwrap().looping, Looping::OneBeat);
         press(&mut ed, "u");
         assert_eq!(ed.draft.as_ref(), Some(&filtered));
         press(&mut ed, "u");
@@ -1487,7 +1542,7 @@ mod tests {
         // A new edit forgets what was undone.
         ed.change(Field::Effect, 1, false);
         ed.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-        assert_eq!(ed.draft.as_ref().unwrap().looping, Looping::None);
+        assert_eq!(ed.transition().unwrap().looping, Looping::None);
     }
 
     #[test]
@@ -1497,14 +1552,14 @@ mod tests {
         ed.pick_field(Field::Volume);
         ed.customize();
         press(&mut ed, "h");
-        assert!(!ed.modified() && ed.draft.as_ref().unwrap().auto);
+        assert!(!ed.modified() && matches!(ed.draft, Some(Draft::Automatic(_))));
     }
 
     #[test]
     fn drawing_a_curve_by_hand() {
         let mut ed = editor();
         // Blend: overlap, A's volume holds then fades from 85%.
-        assert_eq!(ed.draft.as_ref().unwrap().preset(), Some(Preset::Blend));
+        assert_eq!(ed.transition().unwrap().preset(), Some(Preset::Blend));
         ed.pick_field(Field::Volume);
         assert!(matches!(ed.customize(), Action::None));
         assert_eq!(ed.drawing().map(|d| (d.lane, d.track, d.point)), Some((Lane::Volume, Track::Out, 0)));
@@ -1515,7 +1570,7 @@ mod tests {
         assert!((points[1].y - 0.5).abs() < 1e-6);
         // 0.85 of a 32-beat window, on the nearest beat (27), then 4 beats back.
         assert!((points[1].x - 23.0 / 32.0).abs() < 1e-6, "{}", points[1].x);
-        let t = ed.draft.as_ref().unwrap();
+        let t = ed.transition().unwrap();
         assert_eq!(t.preset(), None);
         assert!(t.is_custom(Lane::Volume, Track::Out) && !t.is_custom(Lane::Volume, Track::In));
 
@@ -1535,7 +1590,7 @@ mod tests {
         assert_eq!(ed.drawing().unwrap().track, Track::In);
         ed.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         press(&mut ed, "R");
-        assert!(ed.draft.as_ref().unwrap().curves.is_empty());
+        assert!(ed.transition().unwrap().curves().is_empty());
 
         // Esc goes back to the field drawn, though A's waveform was clicked
         // meanwhile, and the field keys work again.
@@ -1580,7 +1635,7 @@ mod tests {
         assert!((p.x - 0.5).abs() < 1e-6 && (p.y - 0.2).abs() < 1e-6, "snapped to the middle: {p:?}");
         // One drag, one undo step.
         press(&mut ed, "u");
-        assert!(ed.draft.as_ref().unwrap().curves.is_empty());
+        assert!(ed.transition().unwrap().curves().is_empty());
         assert!(!ed.click_curve(Track::Out, 0.3, 0.03, false), "nothing near");
         assert!(ed.click_curve(Track::Out, 0.3, 0.03, true));
         assert_eq!(ed.points().unwrap().len(), 4);
