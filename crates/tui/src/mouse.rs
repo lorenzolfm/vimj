@@ -2,7 +2,7 @@
 //! click can be traced back to what it landed on.
 
 use crate::app::Focus;
-use crate::editor::{Field, Scale};
+use crate::editor::Field;
 use vimj_core::transition::Track;
 use ratatui::layout::{Position, Rect};
 use std::time::{Duration, Instant};
@@ -37,9 +37,8 @@ pub enum Target {
     /// song each column shows.
     Lane(Field, f64),
     /// A song's curve while drawing one, over its waveform: `t0` is the ms
-    /// from the start of the window at its left edge, and `scale` where the
-    /// curve's values sit up it.
-    Curve { track: Track, t0: f64, ms_per_col: f64, duration_ms: f64, scale: Scale },
+    /// from the start of the window at its left edge.
+    Curve { track: Track, t0: f64, ms_per_col: f64, duration_ms: f64 },
     Preset(usize),
     Automatic,
 }

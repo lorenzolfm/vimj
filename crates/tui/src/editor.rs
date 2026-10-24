@@ -591,9 +591,18 @@ impl Editor {
         true
     }
 
-    /// Drags the picked point to (`x`, `y`), onto a beat or the middle when
-    /// within `snap` of one. A whole drag is one undo step.
-    pub fn drag_point(&mut self, x: f32, y: f32, snap: f32) {
+    /// Drags `track`'s picked point to `x` through the window and `height` up
+    /// its lane, onto a beat or the middle when within `snap` of one. A whole
+    /// drag is one undo step. Once a key has moved the drawing to the other
+    /// song, the drag moves nothing.
+    pub fn drag_point(&mut self, track: Track, x: f32, height: f32, snap: f32) {
+        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
+        if d.track != track {
+            return;
+        }
+        // The lane's scale now, not as the drag found it: `u` can turn a
+        // high-pass into a low-pass under it.
+        let y = Scale::of(t, d.lane, track).value(height);
         let per = self.window_beats();
         let on_beat = (x * per).round() / per;
         let x = [on_beat, 0.5].into_iter().find(|s| (s - x).abs() <= snap).unwrap_or(x);
@@ -690,13 +699,13 @@ fn lane_color(lane: Lane) -> Color {
 /// filter is open in the middle, a high-pass closing upwards and a low-pass
 /// downwards, as on a DJ mixer's one filter knob.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Scale {
+struct Scale {
     zero: f32,
     one: f32,
 }
 
 impl Scale {
-    pub fn of(t: &Transition, lane: Lane, track: Track) -> Scale {
+    fn of(t: &Transition, lane: Lane, track: Track) -> Scale {
         match lane {
             Lane::Volume | Lane::Effect => Scale { zero: 0.0, one: 1.0 },
             Lane::Eq => Scale { zero: 0.0, one: 0.5 },
@@ -710,7 +719,7 @@ impl Scale {
     }
 
     /// The value at `height`; past either end, that end's.
-    pub fn value(self, height: f32) -> f32 {
+    fn value(self, height: f32) -> f32 {
         ((height - self.zero) / (self.one - self.zero)).clamp(0.0, 1.0)
     }
 
@@ -1034,13 +1043,11 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
     // otherwise its cue to drag.
     let lane_hits = |hits: &mut Hits, first: usize, track: Track, cue: Target| {
         let lane = mouse::rows(area, first, rows);
-        match drawing.filter(|d| t.curve(d.lane, track).is_some()) {
-            Some(d) => {
-                let scale = Scale::of(t, d.lane, track);
-                let target = Target::Curve { track, t0: tl.t0, ms_per_col: tl.ms_per_col, duration_ms: tl.duration_ms, scale };
-                hits.add(mouse::columns(lane, 2, width), target);
-            }
-            None => hits.add(lane, cue),
+        if drawing.is_some_and(|d| t.curve(d.lane, track).is_some()) {
+            let target = Target::Curve { track, t0: tl.t0, ms_per_col: tl.ms_per_col, duration_ms: tl.duration_ms };
+            hits.add(mouse::columns(lane, 2, width), target);
+        } else {
+            hits.add(lane, cue);
         }
     };
 
@@ -1488,11 +1495,12 @@ mod tests {
         let mut ed = editor();
         ed.pick_field(Field::Eq);
         ed.customize();
-        // Blend's bass on A: full until 60%, gone at the end.
+        // Blend's bass on A: full until 60%, gone at the end. EQ sits in the
+        // lane's lower half, so a height is half the value.
         assert!(ed.click_curve(Track::Out, 0.58, 0.03, false));
         assert_eq!(ed.drawing().unwrap().point, 1);
-        ed.drag_point(0.3, 0.9, 0.0);
-        ed.drag_point(0.49, 0.2, 0.02);
+        ed.drag_point(Track::Out, 0.3, 0.45, 0.0);
+        ed.drag_point(Track::Out, 0.49, 0.1, 0.02);
         let p = ed.points().unwrap()[1];
         assert!((p.x - 0.5).abs() < 1e-6 && (p.y - 0.2).abs() < 1e-6, "snapped to the middle: {p:?}");
         // One drag, one undo step.
@@ -1506,10 +1514,29 @@ mod tests {
         press(&mut ed, "0j");
         let lowered = ed.points().unwrap()[0].y;
         assert!(ed.click_curve(Track::Out, 0.0, 0.03, false));
-        ed.drag_point(0.01, lowered, 0.0);
-        ed.drag_point(0.01, 0.4, 0.0);
+        ed.drag_point(Track::Out, 0.01, lowered / 2.0, 0.0);
+        ed.drag_point(Track::Out, 0.01, 0.2, 0.0);
         press(&mut ed, "u");
         assert_eq!(ed.points().unwrap()[0].y, lowered, "back to before the drag, not before the j");
+    }
+
+    #[test]
+    fn a_drag_follows_the_curve_it_started_on() {
+        let mut ed = editor();
+        // Rise: a high-pass closing on A, a low-pass opening on B.
+        ed.preset(Preset::Rise);
+        ed.pick_field(Field::Filter);
+        ed.customize();
+        assert!(ed.click_curve(Track::Out, 1.0, 0.03, false));
+        // Tab with the button held: the drag is over A's lane, and moves nothing on B.
+        ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let before = ed.draft.clone();
+        ed.drag_point(Track::Out, 1.0, 1.0, 0.0);
+        assert_eq!(ed.draft, before);
+        // A drag on B's low-pass goes the way it's drawn: down closes it.
+        assert!(ed.click_curve(Track::In, 0.0, 0.03, false));
+        ed.drag_point(Track::In, 0.0, 0.0, 0.0);
+        assert_eq!(ed.points().unwrap()[0].y, 1.0);
     }
 
     #[test]

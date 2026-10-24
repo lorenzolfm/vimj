@@ -3,10 +3,11 @@
 //! line (`:`) and search (`/`, `n`, `N`). The mouse works too.
 
 use crate::client::Client;
-use crate::editor::{self, Action, Editor, Field, Scale};
+use crate::editor::{self, Action, Editor, Field};
 use crate::mouse::{Clicks, Hits, Target};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use vimj_core::protocol::*;
+use vimj_core::transition::Track;
 use vimj_core::{Preset, Transition};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
@@ -168,8 +169,8 @@ enum Drag {
     /// Moves a cue point in the transition editor, from where it was when
     /// the button went down at `column`.
     Cue { field: Field, column: u16, from_ms: f64, ms_per_column: f64 },
-    /// Moves the picked point of a curve being drawn, over `area`.
-    Point { area: Rect, t0: f64, ms_per_col: f64, duration_ms: f64, scale: Scale },
+    /// Moves the picked point of `track`'s curve, drawn over `area`.
+    Point { track: Track, area: Rect, t0: f64, ms_per_col: f64, duration_ms: f64 },
 }
 
 pub struct App {
@@ -1280,12 +1281,12 @@ impl App {
                             self.drag = Some(Drag::Cue { field: f, column, from_ms, ms_per_column });
                         }
                     }
-                    Target::Curve { track, t0, ms_per_col, duration_ms, scale } => {
-                        let (x, _) = curve_point(area, t0, ms_per_col, duration_ms, scale, column, row);
+                    Target::Curve { track, t0, ms_per_col, duration_ms } => {
+                        let (x, _) = curve_point(area, t0, ms_per_col, duration_ms, column, row);
                         // Within a column and a half of a point picks it.
                         let reach = (1.5 * ms_per_col / duration_ms) as f32;
                         if ed.click_curve(track, x, reach, double) {
-                            self.drag = Some(Drag::Point { area, t0, ms_per_col, duration_ms, scale });
+                            self.drag = Some(Drag::Point { track, area, t0, ms_per_col, duration_ms });
                         }
                     }
                     Target::Preset(i) => ed.preset(Preset::ALL[i]),
@@ -1321,11 +1322,11 @@ impl App {
                     ed.drag(field, from_ms, -(f64::from(column) - f64::from(from)) * ms_per_column);
                 }
             }
-            Some(Drag::Point { area, t0, ms_per_col, duration_ms, scale }) => {
+            Some(Drag::Point { track, area, t0, ms_per_col, duration_ms }) => {
                 if let Some(ed) = self.editor.as_mut() {
-                    let (x, y) = curve_point(area, t0, ms_per_col, duration_ms, scale, column, row);
+                    let (x, height) = curve_point(area, t0, ms_per_col, duration_ms, column, row);
                     // Half a column either side of a beat lands on it.
-                    ed.drag_point(x, y, (0.5 * ms_per_col / duration_ms) as f32);
+                    ed.drag_point(track, x, height, (0.5 * ms_per_col / duration_ms) as f32);
                 }
             }
             None => {}
@@ -1471,12 +1472,12 @@ pub const COMMANDS: [&str; 24] = [
 ];
 
 /// Where a click at (`column`, `row`) lands on a curve drawn over `area`:
-/// how far through the window, and the value there.
-fn curve_point(area: Rect, t0: f64, ms_per_col: f64, duration_ms: f64, scale: Scale, column: u16, row: u16) -> (f32, f32) {
+/// how far through the window, and how far up the lane.
+fn curve_point(area: Rect, t0: f64, ms_per_col: f64, duration_ms: f64, column: u16, row: u16) -> (f32, f32) {
     let across = f64::from(column.saturating_sub(area.x)) + 0.5;
     let x = (t0 + across * ms_per_col) / duration_ms;
     let down = f64::from(row.saturating_sub(area.y)) / f64::from(area.height.saturating_sub(1).max(1));
-    (x.clamp(0.0, 1.0) as f32, scale.value((1.0 - down) as f32))
+    (x.clamp(0.0, 1.0) as f32, (1.0 - down).clamp(0.0, 1.0) as f32)
 }
 
 /// `at` moved `by` within `0..len`.
