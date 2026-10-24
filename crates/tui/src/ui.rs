@@ -704,7 +704,7 @@ fn draw_help(frame: &mut Frame, screen: Rect, hits: &mut Hits) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(" Transition editor: j/k field · h/l change · c draw curves · u undo · space preview loop · [ ] other pairs · :w save · :q close", dim()),
-            Line::styled(" With the mouse: click a field or its ‹ ›, turn the wheel over it, drag a waveform to move it by beats, double-click a curve to draw it", dim()),
+            Line::styled(" With the mouse: click a field or its ‹ ›, turn the wheel over it, drag a waveform to move it by beats, double-click a curve's field to draw it", dim()),
         ]),
         foot,
     );

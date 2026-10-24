@@ -341,10 +341,10 @@ impl Editor {
             KeyCode::Char('L') => self.move_by_beats(beats),
             KeyCode::Char(',') => self.move_point(-POINT_NUDGE, 0.0),
             KeyCode::Char('.') => self.move_point(POINT_NUDGE, 0.0),
-            KeyCode::Char('k') | KeyCode::Up => self.move_point(0.0, VALUE_STEP),
-            KeyCode::Char('j') | KeyCode::Down => self.move_point(0.0, -VALUE_STEP),
-            KeyCode::Char('K') => self.move_point(0.0, VALUE_JUMP),
-            KeyCode::Char('J') => self.move_point(0.0, -VALUE_JUMP),
+            KeyCode::Char('k') | KeyCode::Up => self.raise(VALUE_STEP),
+            KeyCode::Char('j') | KeyCode::Down => self.raise(-VALUE_STEP),
+            KeyCode::Char('K') => self.raise(VALUE_JUMP),
+            KeyCode::Char('J') => self.raise(-VALUE_JUMP),
             KeyCode::Char('o') | KeyCode::Char('a') => self.add_point(),
             KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => self.delete_point(),
             KeyCode::Char('s') => self.edit_curve(true, |c, i| c.toggle_linear(*i)),
@@ -534,6 +534,14 @@ impl Editor {
         });
     }
 
+    /// Moves the point `by` up the lane as it is drawn, which lowers the
+    /// value of a low-pass, as that closes downwards.
+    fn raise(&mut self, by: f32) {
+        let (Some(d), Some(t)) = (self.drawing(), &self.draft) else { return };
+        let dy = by * Scale::of(t, d.lane, d.track).up();
+        self.move_point(0.0, dy);
+    }
+
     /// Adds a point halfway to the next one, or to the previous from the last.
     fn add_point(&mut self) {
         self.edit_curve(true, |c, i| {
@@ -704,6 +712,11 @@ impl Scale {
     /// The value at `height`; past either end, that end's.
     pub fn value(self, height: f32) -> f32 {
         ((height - self.zero) / (self.one - self.zero)).clamp(0.0, 1.0)
+    }
+
+    /// 1 where higher values sit higher up, -1 where they sit lower.
+    fn up(self) -> f32 {
+        (self.one - self.zero).signum()
     }
 }
 
@@ -1141,7 +1154,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
             let label = Span::styled(format!("{:<9}", name(f)), if on { bold(text()) } else { subtle() });
             let shown = Span::styled(if on { format!("‹ {} ›", value(f)) } else { format!("  {}  ", value(f)) }, if on { bold(accent()) } else { text() });
             let lead = marker.width() + label.width();
-            hits.add(mouse::columns(row, x, if k == 0 { SECOND_COLUMN - x } else { full - x }), Target::Field(f));
+            hits.add(mouse::columns(row, x, if k == 0 { SECOND_COLUMN - x } else { full.saturating_sub(x) }), Target::Field(f));
             if on {
                 // `‹ value ›`: each arrow and the space beside it.
                 hits.add(mouse::columns(row, x + lead, 2), Target::Step(f, -1));
@@ -1497,6 +1510,37 @@ mod tests {
         ed.drag_point(0.01, 0.4, 0.0);
         press(&mut ed, "u");
         assert_eq!(ed.points().unwrap()[0].y, lowered, "back to before the drag, not before the j");
+    }
+
+    #[test]
+    fn keys_move_a_point_up_and_down_the_lane() {
+        let mut ed = editor();
+        // Rise: a high-pass closing on A, which closes upwards, and a
+        // low-pass opening on B, which closes downwards.
+        ed.preset(Preset::Rise);
+        ed.pick_field(Field::Filter);
+        press(&mut ed, "c$k");
+        assert!((ed.points().unwrap()[1].y - 0.85).abs() < 1e-6, "A's high-pass closes further");
+        ed.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        press(&mut ed, "0k");
+        assert!((ed.points().unwrap()[0].y - 0.75).abs() < 1e-6, "B's low-pass opens further");
+        press(&mut ed, "J");
+        assert!((ed.points().unwrap()[0].y - 1.0).abs() < 1e-6, "and closes going down");
+    }
+
+    #[test]
+    fn draws_in_any_size_of_terminal() {
+        let mut ed = editor();
+        for drawing in [false, true] {
+            if drawing {
+                ed.pick_field(Field::Volume);
+                ed.customize();
+            }
+            for (width, height) in [(0, 0), (10, 40), (29, 40), (100, 12), (160, 46)] {
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| draw(f, f.area(), &ed, &HashMap::new(), None, &mut Hits::default())).unwrap();
+            }
+        }
     }
 
     #[test]

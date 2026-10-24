@@ -164,7 +164,7 @@ style, or a preset, puts the style's curves back.
 | --- | --- |
 | `w` `b`, `0` `$` | next / previous point, first / last |
 | `h` `l`, `H` `L` | move the point by a beat, by a bar; `,` `.` nudge it |
-| `j` `k`, `J` `K` | value down / up by 5%, by 25% |
+| `j` `k`, `J` `K` | move the point down / up by 5%, by 25% |
 | `o` | add a point after this one |
 | `x` | delete it (the first and last points stay, and only move up and down) |
 | `s` | ease the segment after it in and out, or run it straight |
