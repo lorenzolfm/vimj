@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use vimj_core::curve::{self, Curve, Point};
 use vimj_core::model::{BEATS_PER_BAR, Grid};
 use vimj_core::protocol::{PlayerState, SongInfo, TransitionDetail};
-use vimj_core::transition::{BAR_CHOICES, Effect, Eq, Filter, FilterKind, Lane, Looping, Preset, Side, Track, Transition, Volume};
+use vimj_core::transition::{BAR_CHOICES, Effect, Eq, Filter, FilterKind, Lane, Lock, Looping, Preset, Side, Track, Transition, Volume};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -755,7 +755,12 @@ impl Timeline {
     }
 
     fn column(&self, x: f32) -> isize {
-        ((f64::from(x) * self.duration_ms - self.t0) / self.ms_per_col).floor() as isize
+        self.column_at(f64::from(x) * self.duration_ms)
+    }
+
+    /// The column `ms` from the start of the window falls in.
+    fn column_at(&self, ms: f64) -> isize {
+        ((ms - self.t0) / self.ms_per_col).floor() as isize
     }
 
     fn in_window(&self, c: usize) -> bool {
@@ -908,34 +913,81 @@ fn song_rows(
         .collect()
 }
 
-/// A song's beats along the timeline, bars taller; `↺` where a loop jumps
-/// back. `down` points the beats down, for the ruler over a waveform.
-fn ruler(
-    tl: &Timeline,
-    grid: Option<Grid>,
-    position: &dyn Fn(f64) -> f64,
-    heard: &dyn Fn(f64) -> bool,
-    seam: &dyn Fn(f64, f64) -> bool,
-    down: bool,
-) -> Line<'static> {
+/// A song's beat on the timeline, in ms from the start of the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Beat {
+    ms: f64,
+    /// It starts a bar.
+    bar: bool,
+}
+
+/// A song's beats across the timeline, when the window starts `start_ms`
+/// into it and it plays at `rate`.
+fn beats(tl: &Timeline, grid: Option<Grid>, start_ms: f64, rate: f64) -> Vec<Beat> {
+    let Some(g) = grid else { return Vec::new() };
+    let at = |ms: f64| start_ms + ms * rate;
+    let (from, to) = (at(tl.time(0.0)).max(0.0), at(tl.time(tl.width as f64)));
+    let (first, end) = (g.beat_at(from).ceil() as i64, g.beat_at(to).ceil() as i64);
+    (first..end)
+        .map(|k| Beat { ms: (g.beat_time(k as f64) - start_ms) / rate, bar: k.rem_euclid(i64::from(BEATS_PER_BAR)) == 0 })
+        .collect()
+}
+
+/// A row of a song's beats as dots, with a green tick on each bar, the window
+/// shaded; `↺` where a loop jumps back. A beat less than half a column from
+/// one of `against` is drawn in that one's column, so that beats which line
+/// up do on screen too.
+fn beat_row(tl: &Timeline, beats: &[Beat], against: &[Beat], heard: &dyn Fn(f64) -> bool, seam: &dyn Fn(f64, f64) -> bool) -> Line<'static> {
+    // Whether each column has a beat, and whether a bar: a bar wins.
+    let mut marks: Vec<Option<bool>> = vec![None; tl.width];
+    for b in beats {
+        let nearest = against.iter().map(|a| a.ms).min_by(|x, y| (x - b.ms).abs().total_cmp(&(y - b.ms).abs()));
+        let ms = nearest.filter(|a| (a - b.ms).abs() < tl.ms_per_col / 2.0).unwrap_or(b.ms);
+        if let Some(mark) = usize::try_from(tl.column_at(ms)).ok().and_then(|c| marks.get_mut(c)) {
+            *mark = Some(mark.unwrap_or(false) | b.bar);
+        }
+    }
     let mut spans = vec![Span::raw("  ")];
-    for c in 0..tl.width {
+    for (c, mark) in marks.into_iter().enumerate() {
         let (start, end) = (tl.time(c as f64), tl.time(c as f64 + 1.0));
-        let (from, to) = (position(start), position(end));
-        let beat = grid.filter(|_| to > 0.0).and_then(|g| {
-            let first = g.beat_at(from).ceil();
-            (g.beat_time(first) < to).then_some(first.rem_euclid(f64::from(BEATS_PER_BAR)) == 0.0)
-        });
+        let base = if tl.in_window(c) { WINDOW } else { PANEL };
         let on = heard(start);
-        let (glyph, color) = match beat {
+        let (glyph, color) = match mark {
+            _ if tl.head_col == Some(c as isize) => ('│', TEXT),
             _ if seam(start, end) => ('↺', LOOPING),
-            Some(true) => ('┃', if on { SUBTLE } else { DIM }),
-            Some(false) => (if down { '╷' } else { '╵' }, if on { DIM } else { FAINT }),
+            Some(true) => ('┃', if on { GREEN } else { mix(GREEN, base, 0.6) }),
+            Some(false) => ('·', if on { DIM } else { FAINT }),
             None => (' ', DIM),
         };
-        spans.push(Span::styled(glyph.to_string(), Style::new().fg(color)));
+        spans.push(Span::styled(glyph.to_string(), Style::new().fg(color).bg(base)));
     }
     Line::from(spans)
+}
+
+/// How B's beats fall on A's, as the line under the songs says it.
+fn lock_note(lock: Lock, a: Grid) -> String {
+    match lock {
+        Lock::Drifting { beats } => {
+            let by = if beats.abs() < 1.0 { format!("{:.0} ms", beats.abs() * a.beat_ms()) } else { format!("{:.1} beats", beats.abs()) };
+            if beats < 0.0 { format!("B falls {by} behind") } else { format!("B pulls {by} ahead") }
+        }
+        Lock::Steady { offset_ms, bar_beats } => {
+            let bars = match bar_beats {
+                0 => None,
+                1 => Some("B's bars a beat late"),
+                3 => Some("B's bars a beat early"),
+                _ => Some("B's bars two beats off"),
+            };
+            let late = if offset_ms > 0.0 { "late" } else { "early" };
+            let beats = (offset_ms.abs() >= 0.5).then(|| format!("{:.0} ms {late}", offset_ms.abs()));
+            match (bars, beats) {
+                (None, None) => "beats and bars line up".into(),
+                (None, Some(beats)) => format!("B's beats {beats}"),
+                (Some(bars), None) => bars.into(),
+                (Some(bars), Some(beats)) => format!("{bars}, its beats {beats}"),
+            }
+        }
+    }
 }
 
 /// `left`, then `right` against the far edge if both fit in `width`.
@@ -1057,38 +1109,44 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
 
     // A over B, as in Spotify, their curves drawn over them.
     let a_cue = Target::Lane(Field::Out, tl.ms_per_col);
-    let first = lines.len();
+    let b_cue = Target::Lane(Field::In, tl.ms_per_col * timing.rate);
     let cue = format!("leaves at {} · beat {}", clock_tenths(t.out_ms), beat_label(ga, t.out_ms));
+    hits.add(mouse::rows(area, lines.len(), 1), a_cue);
     lines.push(song_label("A", &detail.from, cue, selected(Field::Out), full));
-    lines.push(ruler(&tl, ga, &|ms| t.out_ms + ms, &a_heard, &a_seam, true));
-    hits.add(mouse::rows(area, first, 2), a_cue);
     lane_hits(hits, lines.len(), Track::Out, a_cue);
     let a_traces = traces(t, Track::Out, focus, drawing.is_some());
     lines.extend(song_rows(&tl, waveforms.get(&detail.from.song.id), &a_pos, &a_heard, &a_traces, &marks(Track::Out), rows));
 
-    // Between them, the window's length under its middle.
+    // Between them, A's beats on B's: where their bars line up, the ticks
+    // join. A loop keeps A on its tempo, so its beats run on through it.
+    let a_beats = beats(&tl, ga, t.out_ms, 1.0);
+    hits.add(mouse::rows(area, lines.len(), 1), a_cue);
+    lines.push(beat_row(&tl, &a_beats, &[], &a_heard, &a_seam));
+    hits.add(mouse::rows(area, lines.len(), 1), b_cue);
+    lines.push(beat_row(&tl, &beats(&tl, gb, t.in_ms, timing.rate), &a_beats, &b_heard, &|_, _| false));
+
+    lane_hits(hits, lines.len(), Track::In, b_cue);
+    let b_traces = traces(t, Track::In, focus, drawing.is_some());
+    lines.extend(song_rows(&tl, waveforms.get(&detail.to.song.id), &b_pos, &b_heard, &b_traces, &marks(Track::In), rows));
+
+    // Under them, the window's length and how B's beats fall on A's, under
+    // its middle.
     let mut length = format!("{} · {:.1} s", bars(t.bars), timing.duration_ms / 1000.0);
     if t.sync && (timing.rate - 1.0).abs() > 1e-6 {
         length += &format!(" · B at {:.1}%", timing.rate * 100.0);
     }
+    if let (Some(a), Some(b)) = (ga, gb) {
+        length += &format!(" · {}", lock_note(timing.lock(&a, &b), a));
+    }
     let middle = (timing.duration_ms / 2.0 - tl.t0) / tl.ms_per_col;
-    let from = (middle - length.chars().count() as f64 / 2.0).max(0.0) as usize;
+    let from = (middle - length.chars().count() as f64 / 2.0).min(width as f64 - length.chars().count() as f64).max(0.0) as usize;
     let mut gap: Vec<Span> = vec![Span::raw(" "); width];
     for (cell, c) in gap.iter_mut().skip(from).zip(length.chars()) {
         *cell = Span::styled(c.to_string(), subtle());
     }
-    if let Some(cell) = tl.head_col.and_then(|c| usize::try_from(c).ok()).and_then(|c| gap.get_mut(c)) {
-        *cell = Span::styled("│", text());
-    }
     gap.insert(0, Span::raw("  "));
-    lines.push(Line::from(gap));
-
-    let b_cue = Target::Lane(Field::In, tl.ms_per_col * timing.rate);
-    lane_hits(hits, lines.len(), Track::In, b_cue);
-    let b_traces = traces(t, Track::In, focus, drawing.is_some());
-    lines.extend(song_rows(&tl, waveforms.get(&detail.to.song.id), &b_pos, &b_heard, &b_traces, &marks(Track::In), rows));
     let first = lines.len();
-    lines.push(ruler(&tl, gb, &b_pos, &b_heard, &|_, _| false, false));
+    lines.push(Line::from(gap));
     let cue = format!("enters at {} · beat {}", clock_tenths(t.in_ms), beat_label(gb, t.in_ms));
     lines.push(song_label("B", &detail.to, cue, selected(Field::In), full));
     hits.add(mouse::rows(area, first, 2), b_cue);
@@ -1189,7 +1247,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
             dim(),
         ));
     } else {
-        lines.push(Line::styled(format!(" {}", field_note(t, editor.field(), &timing, ga.zip(gb).is_some())), subtle()));
+        lines.push(Line::styled(format!(" {}", field_note(t, editor.field(), &timing, ga.zip(gb))), subtle()));
         lines.push(Line::styled(
             " j/k field · h/l change · 1-9 preset · 0 auto · c draw curves · space preview · u undo · [ ] other transitions · :w save · esc close",
             dim(),
@@ -1200,7 +1258,7 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
 }
 
 /// What the picked field does, and how to change it.
-fn field_note(t: &Transition, field: Field, timing: &vimj_core::transition::Timing, gridded: bool) -> String {
+fn field_note(t: &Transition, field: Field, timing: &vimj_core::transition::Timing, grids: Option<(Grid, Grid)>) -> String {
     let cue_keys = "h/l beat · H/L bar · w/b phrase · ,/. 10 ms · or drag the waveform";
     let curves = |lane: Lane, extra: &str| {
         let custom = custom_on(t, lane);
@@ -1212,12 +1270,13 @@ fn field_note(t: &Transition, field: Field, timing: &vimj_core::transition::Timi
     match field {
         Field::Preset => t.preset().map_or("Your own styles and curves", Preset::description).into(),
         Field::Length => format!("{:.1} s · +/- from any field", timing.duration_ms / 1000.0),
-        Field::Sync => match (t.sync, gridded) {
-            (true, true) if (timing.rate - 1.0).abs() > 1e-6 => {
-                format!("B plays at {:.1}% to lock the beats, then eases back", timing.rate * 100.0)
+        Field::Sync => match (t.sync, grids) {
+            (true, Some((a, b))) if matches!(timing.lock(&a, &b), Lock::Drifting { .. }) => "Tempos too far apart to stretch".into(),
+            (true, Some(_)) if (timing.rate - 1.0).abs() > 1e-6 => {
+                format!("B plays at {:.1}% to keep A's tempo, then eases back", timing.rate * 100.0)
             }
-            (true, true) => "Same tempo, beats locked".into(),
-            (true, false) => "Needs both tempos".into(),
+            (true, Some(_)) => "Same tempo".into(),
+            (true, None) => "Needs both tempos".into(),
             (false, _) => "Tempos left alone".into(),
         },
         Field::Out => format!("Where A starts handing over · {cue_keys}"),
@@ -1584,6 +1643,50 @@ mod tests {
                 terminal.draw(|f| draw(f, f.area(), &ed, &HashMap::new(), None, &mut Hits::default())).unwrap();
             }
         }
+    }
+
+    /// The editor drawn in a terminal of that size, row by row.
+    fn screen(ed: &Editor, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), ed, &HashMap::new(), None, &mut Hits::default())).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect()).collect()
+    }
+
+    #[test]
+    fn the_songs_bars_meet_between_them_when_they_line_up() {
+        let ticks = |row: &str| -> Vec<usize> { row.chars().enumerate().filter(|&(_, c)| c == '┃').map(|(i, _)| i).collect() };
+        // Where A's row of beats sits on B's, and the line under B.
+        let strip = |rows: &[String]| {
+            let at = rows.iter().position(|r| r.contains('┃')).expect("a row of beats");
+            let note = rows.iter().find(|r| r.contains("bars")).expect("a line under B").clone();
+            (ticks(&rows[at]), ticks(&rows[at + 1]), note)
+        };
+        let mut ed = editor();
+        let (a, b, note) = strip(&screen(&ed, 160, 46));
+        assert!(!b.is_empty() && b.iter().all(|c| a.contains(c)), "{a:?} {b:?}");
+        assert!(note.contains("beats and bars line up"), "{note}");
+
+        ed.pick_field(Field::In);
+        press(&mut ed, "l");
+        let (a, b, note) = strip(&screen(&ed, 160, 46));
+        assert!(!b.is_empty() && b.iter().all(|c| !a.contains(c)), "{a:?} {b:?}");
+        assert!(note.contains("B's bars a beat early"), "{note}");
+        press(&mut ed, ".");
+        assert!(strip(&screen(&ed, 160, 46)).2.contains("B's bars a beat early, its beats 10 ms early"));
+    }
+
+    #[test]
+    fn beats_a_hair_apart_share_a_column() {
+        let tl = Timeline { width: 10, t0: 0.0, ms_per_col: 100.0, duration_ms: 1_000.0, head_col: None };
+        let row = |beats: &[Beat], against: &[Beat]| -> String {
+            beat_row(&tl, beats, against, &|_| true, &|_, _| false).spans[1..].iter().map(|s| s.content.as_ref()).collect()
+        };
+        let a = [Beat { ms: 300.0, bar: true }];
+        // B's bar just short of the column edge A's sits on, as rounding leaves it.
+        let b = [Beat { ms: 299.999, bar: true }, Beat { ms: 640.0, bar: false }];
+        assert_eq!(row(&b, &[]), "  ┃   ·   ");
+        assert_eq!(row(&b, &a), "   ┃  ·   ");
     }
 
     #[test]

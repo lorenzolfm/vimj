@@ -994,6 +994,41 @@ pub fn sync_rate(out_bpm: f64, in_bpm: f64) -> Option<f64> {
         .filter(|rate| (rate - 1.0).abs() <= MAX_SYNC)
 }
 
+/// How the incoming song's beats fall on the outgoing song's in a window,
+/// by their grids. Half and double time count as the same tempo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Lock {
+    /// Same tempo: B's beats land `offset_ms` after A's (before, when
+    /// negative), and its bars start `bar_beats` beats after A's, 0 to 3, in
+    /// beats of the faster of the two.
+    Steady { offset_ms: f64, bar_beats: u32 },
+    /// The tempos differ: by the window's end B is this many of A's beats
+    /// ahead of where it started (behind, when negative).
+    Drifting { beats: f64 },
+}
+
+impl Timing {
+    /// How B's beats fall on A's: `from` is A's grid and `to` B's.
+    pub fn lock(&self, from: &Grid, to: &Grid) -> Lock {
+        let a = from.beat_ms();
+        let b = to.beat_ms() / self.rate;
+        let per = [0.5, 1.0, 2.0].into_iter().min_by(|x, y| (a / b / x - 1.0).abs().total_cmp(&(a / b / y - 1.0).abs())).expect("three choices");
+        let drift = self.duration_ms / a * (a / b / per - 1.0);
+        if (drift * a).abs() >= 1.0 {
+            return Lock::Drifting { beats: drift };
+        }
+        // The first beat, or bar with `every` 4, of each at or after the
+        // window's start, in ms into the window.
+        let first = |g: &Grid, start_ms: f64, rate: f64, every: f64| (g.beat_time((g.beat_at(start_ms) / every).ceil() * every) - start_ms) / rate;
+        let finer = a.min(b);
+        let gap = first(to, self.in_start_ms, self.rate, 1.0) - first(from, self.out_start_ms, 1.0, 1.0);
+        let offset_ms = (gap + finer / 2.0).rem_euclid(finer) - finer / 2.0;
+        let bars = first(to, self.in_start_ms, self.rate, 4.0) - offset_ms - first(from, self.out_start_ms, 1.0, 4.0);
+        let bar_beats = (bars / finer).round().rem_euclid(f64::from(BEATS_PER_BAR)) as u32;
+        Lock::Steady { offset_ms, bar_beats }
+    }
+}
+
 /// A song as transitions see it.
 #[derive(Clone, Copy, Debug)]
 pub struct Side<'a> {
@@ -1362,6 +1397,38 @@ mod tests {
         assert!((tm.in_end_ms - tm.in_start_ms - 32.0 * 480.0).abs() < 1e-6);
         t.sync = false;
         assert_eq!(t.timing(Some(&a), Some(&b)).rate, 1.0);
+    }
+
+    #[test]
+    fn lock_measures_how_far_apart_the_beats_land() {
+        let a = Grid { bpm: 120.0, downbeat_ms: 0.0 };
+        let lock = |t: &Transition, b: &Grid| match t.timing(Some(&a), Some(b)).lock(&a, b) {
+            Lock::Steady { offset_ms, bar_beats } => Ok(((offset_ms * 10.0).round() / 10.0, bar_beats)),
+            Lock::Drifting { beats } => Err((beats * 100.0).round() / 100.0),
+        };
+        let mut t = transition(Preset::Blend);
+        t.out_ms = a.beat_time(120.0);
+        let b = Grid { bpm: 125.0, downbeat_ms: 100.0 };
+        t.in_ms = b.beat_time(32.0);
+        assert_eq!(lock(&t, &b), Ok((0.0, 0)));
+        // A beat into B's bar, its bars come a beat before A's.
+        t.in_ms = b.beat_time(33.0);
+        assert_eq!(lock(&t, &b), Ok((0.0, 3)));
+        // 10 ms later into B is 10 ms of it sooner, slowed to A's tempo.
+        t.in_ms = b.beat_time(32.0) + 10.0;
+        assert_eq!(lock(&t, &b), Ok((-10.4, 0)));
+
+        // Half time: B's beat is two of A's.
+        let half = Grid { bpm: 60.0, downbeat_ms: 0.0 };
+        t.in_ms = half.beat_time(8.0);
+        assert_eq!(lock(&t, &half), Ok((0.0, 0)));
+        t.in_ms = half.beat_time(9.0);
+        assert_eq!(lock(&t, &half), Ok((0.0, 2)));
+
+        // Unstretched, B at 125 gains a beat on A at 120 every 24.
+        t.sync = false;
+        t.in_ms = b.beat_time(32.0);
+        assert_eq!(lock(&t, &b), Err(1.33));
     }
 
     #[test]
