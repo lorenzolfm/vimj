@@ -120,8 +120,14 @@ Hold shift to select text in the terminal as usual.
 transition window shaded across both. Each song's curves are drawn over its waveform, one colour per
 kind: volume blue (full at the top), EQ yellow (flat in the middle, cuts go down; the fainter lines
 are the mids and highs), filter pink (open in the middle, a high-pass closes upwards and a low-pass
-downwards; noise grows upwards), effects white (more send, higher). Bar lines run above A and below
-B. When A loops, `↺` marks each jump back and the repeats show dimmer.
+downwards; noise grows upwards), effects white (more send, higher). When A loops, `↺` marks each
+jump back and the repeats show dimmer.
+
+Between the two waveforms, as in Spotify, each song's beats run as a row of dots with a green tick on
+every bar, A's row on B's. Where their bars line up the ticks join into one line; drag a row sideways
+to move that song a beat at a time. A column is a few hundred milliseconds, so the line under B says
+what the grids make of it: `beats and bars line up`, `B's bars a beat early`, `B's beats 20 ms
+late`, or, with sync off, how far B drifts by the window's end.
 
 | | |
 | --- | --- |
