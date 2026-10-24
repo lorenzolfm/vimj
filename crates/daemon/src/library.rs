@@ -16,17 +16,21 @@ use vimj_core::{Analysis, Song, Transition};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Undo steps kept per playlist.
 const HISTORY: usize = 50;
 /// The format of `library.json`. Bumped whenever this build writes what an
 /// older one can't read, so that an older one refuses the file instead.
-const STORE_VERSION: u32 = 1;
+/// 2: transitions no longer say whether they were generated.
+const STORE_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub enum Error {
     NotFound(String),
     Invalid(String),
+    /// The pair's transition changed since the client read it.
+    Changed,
 }
 
 impl std::fmt::Display for Error {
@@ -34,6 +38,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::NotFound(what) => write!(f, "{what} not found"),
             Error::Invalid(why) => f.write_str(why),
+            Error::Changed => f.write_str("the transition changed since it was read"),
         }
     }
 }
@@ -53,6 +58,51 @@ pub struct Playlist {
     pub songs: Vec<String>,
 }
 
+/// The two songs a transition joins, `"{from}>{to}"` in `library.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+struct Pair {
+    from: String,
+    to: String,
+}
+
+impl Pair {
+    fn new(from: &str, to: &str) -> Result<Pair> {
+        Pair::try_from(format!("{from}>{to}")).map_err(Error::Invalid)
+    }
+}
+
+impl TryFrom<String> for Pair {
+    type Error = String;
+
+    fn try_from(key: String) -> std::result::Result<Pair, String> {
+        let Some((from, to)) = key.split_once('>').filter(|(from, to)| !from.is_empty() && !to.is_empty() && !to.contains('>')) else {
+            return Err(format!("{key:?} doesn't name two songs as from>to"));
+        };
+        if from == to {
+            return Err("a song can't transition into itself".into());
+        }
+        Ok(Pair { from: from.to_owned(), to: to.to_owned() })
+    }
+}
+
+impl From<Pair> for String {
+    fn from(pair: Pair) -> String {
+        format!("{}>{}", pair.from, pair.to)
+    }
+}
+
+/// A transition edited by hand, and the revision it was stored at.
+/// Revisions last as long as the daemon, as only its own clients race to
+/// write, and each run starts them past those an earlier one gave out.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+struct Edited {
+    transition: Transition,
+    #[serde(skip)]
+    rev: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Store {
     /// 0 for files from before the format had a number.
@@ -62,9 +112,9 @@ struct Store {
     songs: Vec<Song>,
     #[serde(default)]
     playlists: Vec<Playlist>,
-    /// Hand-edited transitions, keyed `"{from}>{to}"`.
+    /// Hand-edited transitions, by the songs they join.
     #[serde(default)]
-    transitions: HashMap<String, Transition>,
+    transitions: HashMap<Pair, Edited>,
     #[serde(default)]
     next_playlist: u64,
 }
@@ -86,10 +136,8 @@ pub struct Library {
     store: Store,
     states: HashMap<String, SongState>,
     history: HashMap<String, History>,
-}
-
-fn pair_key(from: &str, to: &str) -> String {
-    format!("{from}>{to}")
+    /// The last revision given to an edited transition.
+    revision: u64,
 }
 
 /// Copies a library in an older format aside before this build saves its own
@@ -125,12 +173,18 @@ impl Library {
             keep_for_older_builds(&path, store.version)?;
             store.version = STORE_VERSION;
         }
-        Ok(Library { path, store, states: HashMap::new(), history: HashMap::new() })
+        // From the clock, so that a frontend still holding a revision from
+        // an earlier run can't write over an edit made since.
+        let revision = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+        for edited in store.transitions.values_mut() {
+            edited.rev = revision;
+        }
+        Ok(Library { path, store, states: HashMap::new(), history: HashMap::new(), revision })
     }
 
     #[cfg(test)]
     fn in_memory() -> Library {
-        Library { path: PathBuf::new(), store: Store::default(), states: HashMap::new(), history: HashMap::new() }
+        Library { path: PathBuf::new(), store: Store::default(), states: HashMap::new(), history: HashMap::new(), revision: 0 }
     }
 
     pub fn save(&self) {
@@ -189,7 +243,7 @@ impl Library {
         for p in &mut self.store.playlists {
             p.songs.retain(|s| s != id);
         }
-        self.store.transitions.retain(|k, _| k.split_once('>').is_none_or(|(a, b)| a != id && b != id));
+        self.store.transitions.retain(|pair, _| pair.from != id && pair.to != id);
         self.states.remove(id);
         self.history.clear();
         self.save();
@@ -440,11 +494,20 @@ impl Library {
         compat(analysis(from), analysis(to))
     }
 
-    /// The transition for a pair, and whether it was edited by hand.
-    pub fn transition(&self, from: &str, to: &str) -> Result<(Transition, bool)> {
-        match self.store.transitions.get(&pair_key(from, to)) {
-            Some(t) => Ok((self.fit(from, to, t.clone())?, true)),
-            None => Ok((self.automatic(from, to)?, false)),
+    /// Looks the pair up as asked: one that can't be stored isn't there.
+    fn edited(&self, from: &str, to: &str) -> Option<&Edited> {
+        self.store.transitions.get(&Pair { from: from.to_owned(), to: to.to_owned() })
+    }
+
+    fn source(&self, from: &str, to: &str) -> Source {
+        self.edited(from, to).map_or(Source::Automatic, |e| Source::Edited { rev: e.rev })
+    }
+
+    /// The transition for a pair, and where it comes from.
+    pub fn transition(&self, from: &str, to: &str) -> Result<(Transition, Source)> {
+        match self.edited(from, to) {
+            Some(e) => Ok((self.fit(from, to, e.transition.clone())?, Source::Edited { rev: e.rev })),
+            None => Ok((self.automatic(from, to)?, Source::Automatic)),
         }
     }
 
@@ -462,12 +525,12 @@ impl Library {
     }
 
     pub fn link(&self, from: &str, to: &str) -> Link {
-        let transition = self.transition(from, to).map(|(t, _)| t).expect("both songs exist");
-        Link { transition, compat: self.compat(from, to) }
+        let (transition, source) = self.transition(from, to).expect("both songs exist");
+        Link { transition, compat: self.compat(from, to), source }
     }
 
     pub fn transition_detail(&self, from: &str, to: &str) -> Result<TransitionDetail> {
-        let (transition, saved) = self.transition(from, to)?;
+        let (transition, source) = self.transition(from, to)?;
         let grid = |id: &str| self.song(id).and_then(|s| s.analysis.as_ref()).and_then(|a| a.grid);
         Ok(TransitionDetail {
             from: self.info(from)?,
@@ -475,26 +538,36 @@ impl Library {
             compat: self.compat(from, to),
             timing: transition.timing(grid(from).as_ref(), grid(to).as_ref()),
             transition,
-            saved,
+            source,
             automatic: self.automatic(from, to)?,
         })
     }
 
-    pub fn set_transition(&mut self, from: &str, to: &str, t: Transition) -> Result<TransitionDetail> {
-        let mut t = self.fit(from, to, t)?;
-        if from == to {
-            return Err(Error::Invalid("a song can't transition into itself".into()));
-        }
-        t.auto = false;
-        self.store.transitions.insert(pair_key(from, to), t);
+    /// Stores `t` as the pair's edit, if the pair is still as the client saw it, `base`.
+    pub fn set_transition(&mut self, from: &str, to: &str, base: Source, t: Transition) -> Result<TransitionDetail> {
+        let pair = Pair::new(from, to)?;
+        let transition = self.fit(from, to, t)?;
+        self.check_base(from, to, base)?;
+        self.revision += 1;
+        self.store.transitions.insert(pair, Edited { transition, rev: self.revision });
         self.save();
         self.transition_detail(from, to)
     }
 
-    pub fn reset_transition(&mut self, from: &str, to: &str) -> Result<TransitionDetail> {
-        self.store.transitions.remove(&pair_key(from, to));
+    /// Forgets the pair's edit, on the same terms as storing one.
+    pub fn reset_transition(&mut self, from: &str, to: &str, base: Source) -> Result<TransitionDetail> {
+        self.check_base(from, to, base)?;
+        self.store.transitions.remove(&Pair { from: from.to_owned(), to: to.to_owned() });
         self.save();
         self.transition_detail(from, to)
+    }
+
+    /// Refuses a write from a client that saw the pair other than it is now.
+    fn check_base(&self, from: &str, to: &str, base: Source) -> Result<()> {
+        if self.source(from, to) != base {
+            return Err(Error::Changed);
+        }
+        Ok(())
     }
 
     /// Songs from the whole library that flow best out of the one at `index`.
@@ -540,6 +613,7 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vimj_core::transition::Bars;
     use vimj_core::{Grid, Key};
 
     fn song(id: &str, bpm: f64, tonic: u8, energy: f32) -> Song {
@@ -587,17 +661,22 @@ mod tests {
     /// empty one that the first save would write over it.
     #[test]
     fn a_library_this_build_cant_read_doesnt_load() {
-        let style = |volume: &str| {
+        // A row as older builds wrote it, saying whether it was generated.
+        let row = |pair: &str, volume: &str| {
             format!(
-                r#"{{"transitions": {{"a>b": {{"volume": "{volume}", "eq": "off", "filter": "none", "effect": "none", "looping": "none", "bars": 4, "out_ms": 0, "in_ms": 0, "sync": true, "auto": false}}}}}}"#
+                r#"{{"transitions": {{"{pair}": {{"volume": "{volume}", "eq": "off", "filter": "none", "effect": "none", "looping": "none", "bars": 4, "out_ms": 0, "in_ms": 0, "sync": true, "auto": false}}}}}}"#
             )
         };
         let path = library_file("styles");
-        std::fs::write(&path, style("smooth")).unwrap();
+        std::fs::write(&path, row("a>b", "smooth")).unwrap();
         assert!(Library::load(path.clone()).is_ok());
         // What an older build makes of a style added since.
-        std::fs::write(&path, style("spin_back")).unwrap();
+        std::fs::write(&path, row("a>b", "spin_back")).unwrap();
         assert!(Library::load(path.clone()).is_err());
+        for pair in ["ab", "a>a", "a>b>c", ">b"] {
+            std::fs::write(&path, row(pair, "smooth")).unwrap();
+            assert!(Library::load(path.clone()).is_err(), "{pair:?} doesn't join two songs");
+        }
 
         let path = library_file("newer");
         std::fs::write(&path, format!(r#"{{"version": {}}}"#, STORE_VERSION + 1)).unwrap();
@@ -674,22 +753,40 @@ mod tests {
     #[test]
     fn edited_transitions_stick_and_reset_to_auto() {
         let mut lib = library();
-        let (auto, saved) = lib.transition("a", "c").unwrap();
-        assert!(auto.auto && !saved);
+        let (auto, source) = lib.transition("a", "c").unwrap();
+        assert_eq!(source, Source::Automatic);
         let mut edited = auto.clone();
-        edited.bars = 2;
+        edited.bars = Bars::Two;
         edited.in_ms = 1e9;
-        let detail = lib.set_transition("a", "c", edited).unwrap();
-        assert!(detail.saved && !detail.transition.auto && detail.transition.bars == 2);
+        let detail = lib.set_transition("a", "c", source, edited).unwrap();
+        assert!(matches!(detail.source, Source::Edited { .. }) && detail.transition.bars == Bars::Two);
         assert!(detail.transition.in_ms < 200_000.0, "clamped into the song");
-        assert!(lib.reset_transition("a", "c").unwrap().transition.auto);
+        assert_eq!(lib.reset_transition("a", "c", detail.source).unwrap().source, Source::Automatic);
+    }
+
+    #[test]
+    fn a_write_over_an_edit_its_writer_didnt_see_is_refused() {
+        let mut lib = library();
+        // Two editors read the pair while it is automatic; one stores an edit.
+        let (auto, seen) = lib.transition("a", "c").unwrap();
+        let mut first = auto.clone();
+        first.bars = Bars::Two;
+        let stored = lib.set_transition("a", "c", seen, first).unwrap();
+        // The other's edit, and its going back to automatic, would undo it unseen.
+        assert!(matches!(lib.set_transition("a", "c", seen, auto.clone()), Err(Error::Changed)));
+        assert!(matches!(lib.reset_transition("a", "c", seen), Err(Error::Changed)));
+        assert_eq!(lib.transition("a", "c").unwrap().0.bars, Bars::Two, "the first edit stands");
+        // Once it has read the pair again, it writes, as a revision of its own.
+        let again = lib.set_transition("a", "c", stored.source, auto).unwrap();
+        assert_ne!(again.source, stored.source);
+        assert!(matches!(lib.reset_transition("a", "c", stored.source), Err(Error::Changed)));
     }
 
     #[test]
     fn deleting_a_song_cleans_up_after_it() {
         let mut lib = library();
         let p = lib.create_playlist("Set", vec!["a".into(), "b".into()]).unwrap();
-        lib.set_transition("a", "b", lib.transition("a", "b").unwrap().0).unwrap();
+        lib.set_transition("a", "b", Source::Automatic, lib.transition("a", "b").unwrap().0).unwrap();
         lib.remove_song("b").unwrap();
         assert_eq!(ids(&lib, &p.id), ["a"]);
         assert!(lib.store.transitions.is_empty());

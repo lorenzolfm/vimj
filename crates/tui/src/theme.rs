@@ -1,6 +1,8 @@
 //! Colours and text formatting shared by the views.
 
 use vimj_core::camelot::Camelot;
+use vimj_core::protocol::Source;
+use vimj_core::transition::Bars;
 use vimj_core::{Analysis, Transition};
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -106,7 +108,8 @@ pub fn long_duration(ms: u64) -> String {
     if minutes >= 60 { format!("{}h {:02}m", minutes / 60, minutes % 60) } else { format!("{minutes} min") }
 }
 
-pub fn bars(n: u32) -> String {
+pub fn bars(bars: Bars) -> String {
+    let n = bars.count();
     format!("{n} bar{}", if n == 1 { "" } else { "s" })
 }
 
@@ -117,9 +120,9 @@ pub fn energy_glyph(energy: f32) -> char {
     BLOCKS[1 + ((energy.clamp(0.0, 1.0) * 7.0).round() as usize)]
 }
 
-/// `Blend · 8 bars`, prefixed with `Auto` when generated.
-pub fn transition_summary(t: &Transition) -> String {
-    let lead = if t.auto { "Auto · " } else { "" };
+/// `Blend · 8 bars`, prefixed with `Auto` when vimj picks it.
+pub fn transition_summary(t: &Transition, source: Source) -> String {
+    let lead = if source == Source::Automatic { "Auto · " } else { "" };
     format!("{lead}{} · {}", t.preset_label(), bars(t.bars))
 }
 
@@ -163,7 +166,8 @@ mod tests {
         assert_eq!(clock_tenths(221_234.0), "3:41.2");
         assert_eq!(long_duration(10_260_000), "2h 51m");
         assert_eq!(long_duration(2_520_000), "42 min");
-        assert_eq!(bars(1), "1 bar");
+        assert_eq!(bars(Bars::One), "1 bar");
+        assert_eq!(bars(Bars::Sixteen), "16 bars");
     }
 
     #[test]

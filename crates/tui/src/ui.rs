@@ -251,8 +251,8 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
             let t = &link.transition;
             let (glyph, color) = quality(link.compat.score);
             spans.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
-            let label = format!("{} {}b", t.preset_label(), t.bars);
-            spans.push(Span::styled(fit(&label, cols.link - 7), if t.auto { dim() } else { Style::new().fg(PURPLE) }));
+            let label = format!("{} {}b", t.preset_label(), t.bars.count());
+            spans.push(Span::styled(fit(&label, cols.link - 7), if link.source == Source::Automatic { dim() } else { Style::new().fg(PURPLE) }));
             spans.push(Span::styled(format!("{:>3.0}%", link.compat.score * 100.0), Style::new().fg(color)));
         }
         let mut line = Line::from(spans);
@@ -424,8 +424,8 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &mut App) {
     let width = wave_row.width.saturating_sub(16) as usize;
     let duration = song.duration_ms as f64;
     let wave = app.waveforms.get(&song.id).cloned();
-    let window = p.transition.as_ref().map(|t| {
-        let tm = t.timing(a.and_then(|a| a.grid).as_ref(), p.next.as_ref().and_then(|n| n.analysis.as_ref()).and_then(|a| a.grid).as_ref());
+    let window = p.transition.as_ref().map(|link| {
+        let tm = link.transition.timing(a.and_then(|a| a.grid).as_ref(), p.next.as_ref().and_then(|n| n.analysis.as_ref()).and_then(|a| a.grid).as_ref());
         (tm.out_start_ms, tm.out_end_ms)
     });
     let mut spans = vec![Span::styled(format!("  {:>5} ", clock(position)), subtle())];
@@ -454,14 +454,14 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &mut App) {
             Span::styled("  ◆ mixing into ", Style::new().fg(PURPLE)),
             Span::styled(m.song.title.clone(), bold(text())),
             Span::styled(format!("  {}{}", "▰".repeat(filled), "▱".repeat(20 - filled)), Style::new().fg(PURPLE)),
-            Span::styled(p.transition.as_ref().map_or(String::new(), |t| format!("  {}", transition_summary(t))), dim()),
+            Span::styled(p.transition.as_ref().map_or(String::new(), |l| format!("  {}", transition_summary(&l.transition, l.source))), dim()),
         ])
     } else if let Some(next) = &p.next {
         let when = window.map(|(start, _)| start - position).filter(|ms| *ms > 0.0);
         let mut spans = vec![Span::styled("  next  ", dim()), Span::styled(next.title.clone(), subtle())];
         match (&p.transition, when) {
-            (Some(t), Some(ms)) => spans.push(Span::styled(format!("  · {} in {}", transition_summary(t), clock(ms)), dim())),
-            (Some(t), None) => spans.push(Span::styled(format!("  · {}", transition_summary(t)), dim())),
+            (Some(l), Some(ms)) => spans.push(Span::styled(format!("  · {} in {}", transition_summary(&l.transition, l.source), clock(ms)), dim())),
+            (Some(l), None) => spans.push(Span::styled(format!("  · {}", transition_summary(&l.transition, l.source)), dim())),
             (None, _) => spans.push(Span::styled("  · back to back", dim())),
         }
         Line::from(spans)

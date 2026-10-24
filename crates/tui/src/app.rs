@@ -2,13 +2,13 @@
 //! operators (`5j`, `dd`, `yy`, `p`), a visual line mode (`V`), a command
 //! line (`:`) and search (`/`, `n`, `N`). The mouse works too.
 
-use crate::client::Client;
-use crate::editor::{self, Action, Editor, Field};
+use crate::client::{Client, Saved};
+use crate::editor::{self, Action, Draft, Editor, Field};
 use crate::mouse::{Clicks, Hits, Target};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use vimj_core::protocol::*;
 use vimj_core::transition::Track;
-use vimj_core::{Preset, Transition};
+use vimj_core::Preset;
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -34,7 +34,10 @@ pub enum Msg {
     Suggestions { playlist: String, anchor: usize, list: Vec<Suggestion> },
     Transition(TransitionDetail),
     /// `:w` stored `sent`; `close` shuts the editor now.
-    Saved { detail: TransitionDetail, sent: Transition, close: bool },
+    Saved { detail: TransitionDetail, sent: Draft, close: bool },
+    /// `:w` found the pair changed since the editor read it, by another
+    /// frontend, and wrote nothing.
+    Changed { from: String, to: String },
     Waveform(String, Option<Vec<u8>>),
     Player(PlayerState),
     Downloads(Vec<Download>),
@@ -397,7 +400,8 @@ impl App {
                 }
             }
             Msg::Saved { detail, sent, close } => {
-                self.info(format!("Saved the transition into {}: {}", detail.to.song.title, crate::theme::transition_summary(&detail.transition)));
+                let summary = crate::theme::transition_summary(&detail.transition, detail.source);
+                self.info(format!("Saved the transition into {}: {summary}", detail.to.song.title));
                 if let Some(ed) = &mut self.editor
                     && ed.is_pair(&detail)
                 {
@@ -406,6 +410,12 @@ impl App {
                         self.close_editor();
                     }
                 }
+            }
+            Msg::Changed { from, to } => {
+                self.error("Another vimj changed this transition since you opened it: :w again replaces theirs, :e! takes it");
+                // The draft stays, now set against what is stored.
+                let c = self.client();
+                self.spawn(async move { c.transition(&from, &to).await }, Msg::Transition);
             }
             Msg::Waveform(id, bytes) => {
                 if let Some(bytes) = bytes {
@@ -1089,17 +1099,24 @@ impl App {
     /// `:w` stores the draft; `close` then shuts the editor.
     fn write_transition(&mut self, close: bool) {
         let Some(ed) = &self.editor else { return };
-        let Some(t) = ed.draft.clone() else {
+        let (Some(draft), Some(base)) = (ed.draft.clone(), ed.detail.as_ref().map(|d| d.source)) else {
             self.error("The transition hasn't loaded yet");
             return;
         };
-        let ((from, to), c, sent) = (ed.pair(), self.client(), t.clone());
+        let ((from, to), c, sent) = (ed.pair(), self.client(), draft.clone());
+        let pair = (from.clone(), to.clone());
         self.spawn(
             async move {
-                // An automatic one is stored by forgetting the edited one.
-                if t.auto { c.reset_transition(&from, &to).await } else { c.set_transition(&from, &to, &t).await }
+                match draft {
+                    // An automatic one is stored by forgetting the edited one.
+                    Draft::Automatic(_) => c.reset_transition(&from, &to, base).await,
+                    Draft::Edited(t) => c.set_transition(&from, &to, base, t).await,
+                }
             },
-            move |detail| Msg::Saved { detail, sent, close },
+            move |saved| match saved {
+                Saved::Stored(detail) => Msg::Saved { detail, sent, close },
+                Saved::Changed => Msg::Changed { from: pair.0, to: pair.1 },
+            },
         );
     }
 

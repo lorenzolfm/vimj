@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PORT: u16 = 8787;
 /// What the daemon's [`Status`] says it speaks. Bumped whenever the API
 /// changes so that frontends and daemons of different builds can't talk.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 /// Playlist id of the whole library, which can be ordered and mixed like any playlist.
 pub const LIBRARY_ID: &str = "library";
 /// How many suggestions the "transition to…" menu offers.
@@ -72,11 +72,23 @@ pub struct Playlists {
     pub playlists: Vec<PlaylistSummary>,
 }
 
+/// Where a pair's transition comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Source {
+    /// Worked out from both songs each time, so it follows their analysis.
+    Automatic,
+    /// Edited by hand and stored, at revision `rev`. Writes name the source
+    /// they last saw, so that one made over someone else's edit is refused.
+    Edited { rev: u64 },
+}
+
 /// How one song flows into the next.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Link {
     pub transition: Transition,
     pub compat: Compat,
+    pub source: Source,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,8 +117,7 @@ pub struct TransitionDetail {
     pub compat: Compat,
     pub transition: Transition,
     pub timing: Timing,
-    /// Hand-edited and stored, rather than generated.
-    pub saved: bool,
+    pub source: Source,
     /// What vimj picks for the pair by itself, which resetting goes back to.
     pub automatic: Transition,
 }
@@ -168,8 +179,9 @@ pub struct PlayerState {
     pub rate: f64,
     pub mixing: Option<Mixing>,
     pub next: Option<Song>,
-    /// Transition into `next`, when mixing.
-    pub transition: Option<Transition>,
+    /// How `song` flows into `next`. A preview plays the editor's draft,
+    /// with the source of what is stored for the pair.
+    pub transition: Option<Link>,
     pub volume: u8,
     /// Looping a single transition from the editor.
     pub preview: bool,
@@ -251,6 +263,21 @@ pub struct MoveSongs {
 pub struct PlaceAfter {
     pub anchor: usize,
     pub song: String,
+}
+
+/// `PUT /api/transitions/{from}/{to}`: stores `transition` as the pair's
+/// edit, if the pair is still as `base` says the client last saw it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SaveTransition {
+    pub base: Source,
+    pub transition: Transition,
+}
+
+/// `DELETE /api/transitions/{from}/{to}`: forgets the pair's edit, back to
+/// its automatic transition, on the same terms.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForgetTransition {
+    pub base: Source,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

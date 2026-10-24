@@ -32,6 +32,7 @@ impl From<library::Error> for ApiError {
         let status = match e {
             library::Error::NotFound(_) => StatusCode::NOT_FOUND,
             library::Error::Invalid(_) => StatusCode::BAD_REQUEST,
+            library::Error::Changed => StatusCode::CONFLICT,
         };
         ApiError(status, e.to_string())
     }
@@ -255,15 +256,19 @@ fn transition_changed(app: &App) {
 async fn set_transition(
     State(app): Shared,
     Path((from, to)): Path<(String, String)>,
-    Json(t): Json<Transition>,
+    Json(req): Json<SaveTransition>,
 ) -> ApiResult<TransitionDetail> {
-    let detail = app.lib.lock().expect("library lock").set_transition(&from, &to, t)?;
+    let detail = app.lib.lock().expect("library lock").set_transition(&from, &to, req.base, req.transition)?;
     transition_changed(&app);
     Ok(Json(detail))
 }
 
-async fn reset_transition(State(app): Shared, Path((from, to)): Path<(String, String)>) -> ApiResult<TransitionDetail> {
-    let detail = app.lib.lock().expect("library lock").reset_transition(&from, &to)?;
+async fn reset_transition(
+    State(app): Shared,
+    Path((from, to)): Path<(String, String)>,
+    Json(req): Json<ForgetTransition>,
+) -> ApiResult<TransitionDetail> {
+    let detail = app.lib.lock().expect("library lock").reset_transition(&from, &to, req.base)?;
     transition_changed(&app);
     Ok(Json(detail))
 }

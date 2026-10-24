@@ -26,10 +26,32 @@ pub enum Answer {
     Stranger,
 }
 
+/// What came of storing an edit, or forgetting one.
+#[allow(clippy::large_enum_variant)]
+pub enum Saved {
+    Stored(TransitionDetail),
+    /// The pair changed since the editor read it, so nothing was written.
+    Changed,
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     base: String,
+}
+
+/// The daemon's answer, or the error it gives.
+async fn read<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    if !status.is_success() {
+        let message = serde_json::from_slice::<ErrorBody>(&bytes)
+            .map(|e| e.error)
+            .unwrap_or_else(|_| format!("daemon returned {status}"));
+        return Err(anyhow!(message));
+    }
+    let body = if bytes.is_empty() { b"null".as_slice() } else { &bytes };
+    Ok(serde_json::from_slice(body)?)
 }
 
 impl Client {
@@ -40,17 +62,17 @@ impl Client {
     }
 
     async fn send<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
+        read(request.send().await?).await
+    }
+
+    /// Sends a write to a pair's transition, which the daemon refuses when
+    /// the pair changed since the editor read it.
+    async fn save(&self, request: reqwest::RequestBuilder) -> Result<Saved> {
         let response = request.send().await?;
-        let status = response.status();
-        let bytes = response.bytes().await?;
-        if !status.is_success() {
-            let message = serde_json::from_slice::<ErrorBody>(&bytes)
-                .map(|e| e.error)
-                .unwrap_or_else(|_| format!("daemon returned {status}"));
-            return Err(anyhow!(message));
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(Saved::Changed);
         }
-        let body = if bytes.is_empty() { b"null".as_slice() } else { &bytes };
-        Ok(serde_json::from_slice(body)?)
+        read(response).await.map(Saved::Stored)
     }
 
     fn url(&self, path: &str) -> String {
@@ -176,12 +198,14 @@ impl Client {
         self.get(&format!("/api/transitions/{from}/{to}")).await
     }
 
-    pub async fn set_transition(&self, from: &str, to: &str, t: &Transition) -> Result<TransitionDetail> {
-        self.send(self.http.put(self.url(&format!("/api/transitions/{from}/{to}"))).json(t)).await
+    /// Stores `transition` as the pair's edit; `base` is the pair as last read.
+    pub async fn set_transition(&self, from: &str, to: &str, base: Source, transition: Transition) -> Result<Saved> {
+        self.save(self.http.put(self.url(&format!("/api/transitions/{from}/{to}"))).json(&SaveTransition { base, transition })).await
     }
 
-    pub async fn reset_transition(&self, from: &str, to: &str) -> Result<TransitionDetail> {
-        self.delete(&format!("/api/transitions/{from}/{to}")).await
+    /// Forgets the pair's edit; `base` is the pair as last read.
+    pub async fn reset_transition(&self, from: &str, to: &str, base: Source) -> Result<Saved> {
+        self.save(self.http.delete(self.url(&format!("/api/transitions/{from}/{to}"))).json(&ForgetTransition { base })).await
     }
 
     pub async fn play(&self, context: String, index: usize, position_ms: f64) -> Result<PlayerState> {

@@ -6,7 +6,7 @@ use crate::library::{self, Library};
 use vimj_audio::engine::{Command, Plan, State};
 use vimj_audio::player::{Output, Player};
 use vimj_core::Transition;
-use vimj_core::protocol::{Mixing, PlayerState, PlayerStatus};
+use vimj_core::protocol::{Link, Mixing, PlayerState, PlayerStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
@@ -149,7 +149,10 @@ impl Playback {
         let next = snapshot.index.and_then(|i| song_at(i + 1));
         let draft = current.preview.as_ref().and_then(|p| p.draft.clone());
         let transition = match (&song, &next) {
-            (Some(a), Some(b)) => draft.or_else(|| lib.transition(&a.id, &b.id).ok().map(|(t, _)| t)),
+            (Some(a), Some(b)) => {
+                let link = lib.link(&a.id, &b.id);
+                Some(Link { transition: draft.unwrap_or(link.transition), ..link })
+            }
             _ => None,
         };
         let mixing = snapshot.incoming.and_then(|(i, position_ms, progress)| {

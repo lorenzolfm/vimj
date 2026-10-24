@@ -6,7 +6,7 @@
 use vimj_audio::engine::{Command, Engine, Entry, Plan, normalising_gain};
 use vimj_audio::{analysis, pcm};
 use vimj_core::compat::compat;
-use vimj_core::transition::{Preset, Side, auto_transition};
+use vimj_core::transition::{Bars, Preset, Side, auto_transition};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
         t.set_preset(preset);
     }
     if let Some(bars) = rest.get(1) {
-        t.bars = bars.parse()?;
+        t.bars = Bars::try_from(bars.parse::<u32>()?).map_err(anyhow::Error::msg)?;
         t.clamp(side(&a_pcm, &a), side(&b_pcm, &b));
     }
     let timing = t.timing(a.grid.as_ref(), b.grid.as_ref());

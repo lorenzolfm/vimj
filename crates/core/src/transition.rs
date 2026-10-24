@@ -19,10 +19,57 @@ pub const FALLBACK_BPM: f64 = 120.0;
 pub const MAX_SYNC: f64 = 0.10;
 /// The incoming song keeps at least this much after the transition.
 pub const MIN_REMAINING_MS: f64 = 5_000.0;
-/// Transition lengths offered, in bars of the outgoing song.
-pub const BAR_CHOICES: [u32; 5] = [1, 2, 4, 8, 16];
 /// Phrase length used to place automatic transitions.
 pub const PHRASE_BARS: u32 = 8;
+
+/// How long a transition lasts, in bars of the outgoing song: the lengths
+/// Spotify offers. Stored and sent as the number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub enum Bars {
+    One = 1,
+    Two = 2,
+    Four = 4,
+    Eight = 8,
+    Sixteen = 16,
+}
+
+impl Bars {
+    pub const ALL: [Bars; 5] = [Bars::One, Bars::Two, Bars::Four, Bars::Eight, Bars::Sixteen];
+
+    pub fn count(self) -> u32 {
+        self as u32
+    }
+
+    /// Where it is in `ALL`: each length doubles the one before.
+    fn index(self) -> usize {
+        self.count().trailing_zeros() as usize
+    }
+
+    /// Half as long, unless it is one bar already.
+    pub fn shorter(self) -> Option<Bars> {
+        self.index().checked_sub(1).map(|i| Bars::ALL[i])
+    }
+
+    /// `by` lengths longer, or shorter when negative, stopping at the ends.
+    pub fn step(self, by: i32) -> Bars {
+        Bars::ALL[(self.index() as i32 + by).clamp(0, Bars::ALL.len() as i32 - 1) as usize]
+    }
+}
+
+impl TryFrom<u32> for Bars {
+    type Error = String;
+
+    fn try_from(n: u32) -> Result<Bars, String> {
+        Bars::ALL.into_iter().find(|b| b.count() == n).ok_or_else(|| format!("a transition lasts 1, 2, 4, 8 or 16 bars, not {n}"))
+    }
+}
+
+impl From<Bars> for u32 {
+    fn from(bars: Bars) -> u32 {
+        bars.count()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -669,28 +716,44 @@ pub struct Moment {
     pub inc: DeckFx,
 }
 
+/// The styles that draw curves are set only through `set_volume` and the
+/// rest, which drop the curves drawn over the old style: a curve left where
+/// the new style draws none wouldn't read back.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "Stored", into = "Stored")]
 pub struct Transition {
-    pub volume: Volume,
-    pub eq: Eq,
-    pub filter: Filter,
-    pub effect: Effect,
+    volume: Volume,
+    eq: Eq,
+    filter: Filter,
+    effect: Effect,
     pub looping: Looping,
-    pub curves: Curves,
-    /// Length in bars of the outgoing song.
-    pub bars: u32,
+    curves: Curves,
+    pub bars: Bars,
     /// Position in the outgoing song where the transition starts.
     pub out_ms: f64,
     /// Position in the incoming song at that moment.
     pub in_ms: f64,
     /// Stretch the incoming song to the outgoing tempo while they overlap.
     pub sync: bool,
-    /// Generated rather than edited by hand.
-    pub auto: bool,
 }
 
 impl Transition {
+    /// A preset over a window, with nothing drawn by hand.
+    pub fn new(preset: Preset, bars: Bars, out_ms: f64, in_ms: f64, sync: bool) -> Transition {
+        let s = preset.styles();
+        Transition { volume: s.volume, eq: s.eq, filter: s.filter, effect: s.effect, looping: s.looping, curves: Curves::default(), bars, out_ms, in_ms, sync }
+    }
+
+    /// This one's window with `other`'s styles and curves, for a transition
+    /// already under way when edits to it arrive.
+    pub fn restyled(&self, other: &Transition) -> Transition {
+        Transition { bars: self.bars, out_ms: self.out_ms, in_ms: self.in_ms, sync: self.sync, ..other.clone() }
+    }
+
+    pub fn curves(&self) -> &Curves {
+        &self.curves
+    }
+
     pub fn styles(&self) -> Styles {
         Styles { volume: self.volume, eq: self.eq, filter: self.filter, effect: self.effect, looping: self.looping }
     }
@@ -709,9 +772,7 @@ impl Transition {
 
     /// Takes on a preset's styles, dropping curves drawn by hand.
     pub fn set_preset(&mut self, preset: Preset) {
-        let s = preset.styles();
-        (self.volume, self.eq, self.filter, self.effect, self.looping) = (s.volume, s.eq, s.filter, s.effect, s.looping);
-        self.curves = Curves::default();
+        *self = Transition::new(preset, self.bars, self.out_ms, self.in_ms, self.sync);
     }
 
     // A new style replaces the curves drawn over the old one.
@@ -805,7 +866,7 @@ impl Transition {
 
     pub fn timing(&self, from: Option<&Grid>, to: Option<&Grid>) -> Timing {
         let beat = from.map_or(60_000.0 / FALLBACK_BPM, Grid::beat_ms);
-        let duration_ms = f64::from(self.bars * BEATS_PER_BAR) * beat;
+        let duration_ms = f64::from(self.bars.count() * BEATS_PER_BAR) * beat;
         let rate = match (self.sync, from, to) {
             (true, Some(a), Some(b)) => sync_rate(a.bpm, b.bpm).unwrap_or(1.0),
             _ => 1.0,
@@ -823,7 +884,7 @@ impl Transition {
     /// Where the loop sends the outgoing song, in its milliseconds; `from` is its grid.
     pub fn loop_map(&self, from: Option<&Grid>) -> Option<LoopMap> {
         let beat = from.map_or(60_000.0 / FALLBACK_BPM, Grid::beat_ms);
-        let window_beats = f64::from(self.bars * BEATS_PER_BAR);
+        let window_beats = f64::from(self.bars.count() * BEATS_PER_BAR);
         let blocks = self.looping.blocks(window_beats);
         if blocks.is_empty() {
             return None;
@@ -839,12 +900,14 @@ impl Transition {
     /// Keeps the window inside both songs, shortening it if a song is too short.
     pub fn clamp(&mut self, from: Side, to: Side) {
         let (a, b) = (from.grid(), to.grid());
-        while self.bars > 1 {
-            let t = self.timing(a.as_ref(), b.as_ref());
-            if t.duration_ms <= from.duration_ms && t.duration_ms * t.rate + MIN_REMAINING_MS <= to.duration_ms {
-                break;
-            }
-            self.bars /= 2;
+        let fits = |t: &Transition| {
+            let t = t.timing(a.as_ref(), b.as_ref());
+            t.duration_ms <= from.duration_ms && t.duration_ms * t.rate + MIN_REMAINING_MS <= to.duration_ms
+        };
+        while !fits(self)
+            && let Some(shorter) = self.bars.shorter()
+        {
+            self.bars = shorter;
         }
         let t = self.timing(a.as_ref(), b.as_ref());
         self.out_ms = self.out_ms.clamp(0.0, (from.duration_ms - t.duration_ms).max(0.0));
@@ -855,7 +918,8 @@ impl Transition {
 
 /// A transition as stored and sent. Stored ones may be from before filter,
 /// effects and looping were separate: `effect` then held a filter sweep, an
-/// echo or a brake.
+/// echo or a brake. They may also say whether they were generated, `auto`,
+/// which is left unread: what the library keeps is edited.
 #[derive(Serialize, Deserialize)]
 struct Stored {
     /// The preset the styles make, for frontends. Worked out again on
@@ -871,11 +935,10 @@ struct Stored {
     looping: Looping,
     #[serde(default, skip_serializing_if = "Curves::is_empty")]
     curves: Curves,
-    bars: u32,
+    bars: Bars,
     out_ms: f64,
     in_ms: f64,
     sync: bool,
-    auto: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -898,15 +961,12 @@ enum OldEffect {
     Brake,
 }
 
-/// Checks what the types can't: the length, and that curves drawn by hand
-/// are where a style draws one.
+/// Checks what the types can't: that curves drawn by hand are where a style
+/// draws one.
 impl TryFrom<Stored> for Transition {
     type Error = String;
 
     fn try_from(s: Stored) -> Result<Transition, String> {
-        if !BAR_CHOICES.contains(&s.bars) {
-            return Err(format!("a transition lasts 1, 2, 4, 8 or 16 bars, not {}", s.bars));
-        }
         let (filter, effect) = match s.effect {
             StoredEffect::Current(effect) => (s.filter.unwrap_or(Filter::None), effect),
             StoredEffect::Old(old) => match old {
@@ -931,7 +991,6 @@ impl TryFrom<Stored> for Transition {
             out_ms: s.out_ms,
             in_ms: s.in_ms,
             sync: s.sync,
-            auto: s.auto,
         };
         for lane in Lane::ALL {
             for track in [Track::Out, Track::In] {
@@ -966,7 +1025,6 @@ impl From<Transition> for Stored {
             out_ms: t.out_ms,
             in_ms: t.in_ms,
             sync: t.sync,
-            auto: t.auto,
         }
     }
 }
@@ -1057,20 +1115,7 @@ pub fn auto_transition(from: Side, to: Side, compat: &Compat) -> Transition {
     let (a, b) = (from.grid(), to.grid());
     let synced = matches!((a, b), (Some(a), Some(b)) if sync_rate(a.bpm, b.bpm).is_some());
     let (preset, bars) = auto_preset(a.is_some() && b.is_some(), synced, compat);
-    let mut t = Transition {
-        volume: Volume::Smooth,
-        eq: Eq::Off,
-        filter: Filter::None,
-        effect: Effect::None,
-        looping: Looping::None,
-        curves: Curves::default(),
-        bars,
-        out_ms: 0.0,
-        in_ms: 0.0,
-        sync: synced,
-        auto: true,
-    };
-    t.set_preset(preset);
+    let mut t = Transition::new(preset, bars, 0.0, 0.0, synced);
 
     t.in_ms = match b {
         // Small tolerance so a downbeat right at the onset still counts.
@@ -1093,25 +1138,25 @@ pub fn auto_transition(from: Side, to: Side, compat: &Compat) -> Transition {
     t
 }
 
-fn auto_preset(gridded: bool, synced: bool, compat: &Compat) -> (Preset, u32) {
+fn auto_preset(gridded: bool, synced: bool, compat: &Compat) -> (Preset, Bars) {
     if !gridded {
-        return (Preset::Fade, 4);
+        return (Preset::Fade, Bars::Four);
     }
     if !synced {
         // Beats can't be lined up, so keep the overlap short.
-        return (Preset::Fade, 2);
+        return (Preset::Fade, Bars::Two);
     }
     let lift = compat.energy.map_or(0.0, |e| e.delta());
     let key_ok = compat.key.is_none_or(|k| k.relation.score() >= 0.85);
     if lift >= 0.15 {
-        (Preset::Rise, 8)
+        (Preset::Rise, Bars::Eight)
     } else if lift <= -0.2 {
-        (Preset::Melt, 4)
+        (Preset::Melt, Bars::Four)
     } else if key_ok {
-        (Preset::Blend, 8)
+        (Preset::Blend, Bars::Eight)
     } else {
         // Filters keep clashing keys from fighting for long.
-        (Preset::Wave, 4)
+        (Preset::Wave, Bars::Four)
     }
 }
 
@@ -1121,21 +1166,7 @@ mod tests {
     use crate::compat::{compat, tests::feat};
 
     fn transition(preset: Preset) -> Transition {
-        let mut t = Transition {
-            volume: Volume::Smooth,
-            eq: Eq::Off,
-            filter: Filter::None,
-            effect: Effect::None,
-            looping: Looping::None,
-            curves: Curves::default(),
-            bars: 8,
-            out_ms: 0.0,
-            in_ms: 0.0,
-            sync: true,
-            auto: false,
-        };
-        t.set_preset(preset);
-        t
+        Transition::new(preset, Bars::Eight, 0.0, 0.0, true)
     }
 
     /// Every combination of styles, one ingredient changed at a time.
@@ -1443,7 +1474,7 @@ mod tests {
         let from = Side { duration_ms: 205_000.0, analysis: Some(&fa) };
         let to = Side { duration_ms: 180_000.0, analysis: Some(&fb) };
         let t = auto_transition(from, to, &c);
-        assert!(t.auto && t.sync);
+        assert!(t.sync);
         assert_eq!(t.preset(), Some(Preset::Blend));
         let ga = fa.grid.unwrap();
         let gb = fb.grid.unwrap();
@@ -1464,9 +1495,9 @@ mod tests {
         let side = |f| Side { duration_ms: 200_000.0, analysis: Some(f) };
         let t = auto_transition(side(&fa), side(&fb), &c);
         assert!(!t.sync);
-        assert_eq!(t.bars, 2);
+        assert_eq!(t.bars, Bars::Two);
         let none = auto_transition(Side { duration_ms: 200_000.0, analysis: None }, side(&fb), &c);
-        assert_eq!((none.preset(), none.bars, none.sync), (Some(Preset::Fade), 4, false));
+        assert_eq!((none.preset(), none.bars, none.sync), (Some(Preset::Fade), Bars::Four, false));
         assert_eq!(none.out_ms, 200_000.0 - 8_000.0);
     }
 
@@ -1483,6 +1514,14 @@ mod tests {
     }
 
     #[test]
+    fn lengths_step_and_halve_within_the_choices() {
+        assert_eq!(Bars::ALL.map(|b| b.step(1)), [Bars::Two, Bars::Four, Bars::Eight, Bars::Sixteen, Bars::Sixteen]);
+        assert_eq!(Bars::ALL.map(|b| b.step(-1)), [Bars::One, Bars::One, Bars::Two, Bars::Four, Bars::Eight]);
+        assert_eq!(Bars::Two.step(-9), Bars::One);
+        assert_eq!(Bars::ALL.map(Bars::shorter), [None, Some(Bars::One), Some(Bars::Two), Some(Bars::Four), Some(Bars::Eight)]);
+    }
+
+    #[test]
     fn clamp_keeps_the_window_inside_both_songs() {
         let mut t = transition(Preset::Blend);
         t.out_ms = 500_000.0;
@@ -1493,7 +1532,7 @@ mod tests {
         let short = Side { duration_ms: 20_000.0, analysis: Some(&f) };
         t.clamp(Side { duration_ms: 200_000.0, analysis: Some(&f) }, short);
         // 8 bars (16 s) plus 5 s left over don't fit in 20 s, 4 bars do.
-        assert_eq!(t.bars, 4);
+        assert_eq!(t.bars, Bars::Four);
         assert_eq!(t.out_ms, 200_000.0 - 8_000.0);
         assert_eq!(t.in_ms, 20_000.0 - MIN_REMAINING_MS - 8_000.0);
     }

@@ -452,7 +452,7 @@ impl Engine {
         let per_ms = f64::from(self.rate) / 1000.0;
         // Echoes repeat in beats as heard, at the deck's tempo.
         let beat_ms = grid.map_or(500.0, |g| g.beat_ms()) / main.deck.tempo();
-        main.deck.set_effect(active.transition.effect.kind(), beat_ms * per_ms);
+        main.deck.set_effect(active.transition.styles().effect.kind(), beat_ms * per_ms);
         main.deck.set_loop(active.transition.loop_map(grid.as_ref()).map(|m| m.scaled(per_ms)));
     }
 
@@ -509,7 +509,7 @@ impl Engine {
         let Some(active) = self.active.take() else { return };
         if let Some(mut old) = self.main.take() {
             old.deck.retire();
-            if !active.transition.effect.rings_out() {
+            if !active.transition.styles().effect.rings_out() {
                 old.deck.cut_tail();
             }
             self.tails.push(old.deck);
@@ -578,8 +578,7 @@ impl Engine {
                 // Same pair: keep going, with the new styles and curves. The
                 // window under way keeps its timing, which its loop follows.
                 if let Some(t) = &self.plan.entries[index].next {
-                    let now = &active.transition;
-                    active.transition = Transition { bars: now.bars, out_ms: now.out_ms, in_ms: now.in_ms, sync: now.sync, ..t.clone() };
+                    active.transition = active.transition.restyled(t);
                 }
                 if let Some(i) = self.incoming.as_mut() {
                     i.index = index + 1;
@@ -610,7 +609,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vimj_core::transition::{Curves, Effect, Eq, Filter, Looping, Preset, Volume};
+    use vimj_core::transition::{Bars, Effect, Looping, Preset, Volume};
 
     const RATE: u32 = 48_000;
 
@@ -640,22 +639,8 @@ mod tests {
         }
     }
 
-    fn blend(out_ms: f64, in_ms: f64, bars: u32) -> Transition {
-        let mut t = Transition {
-            volume: Volume::Smooth,
-            eq: Eq::Off,
-            filter: Filter::None,
-            effect: Effect::None,
-            looping: Looping::None,
-            curves: Curves::default(),
-            bars,
-            out_ms,
-            in_ms,
-            sync: true,
-            auto: false,
-        };
-        t.set_preset(Preset::Fade);
-        t
+    fn blend(out_ms: f64, in_ms: f64, bars: Bars) -> Transition {
+        Transition::new(Preset::Fade, bars, out_ms, in_ms, true)
     }
 
     /// Engine with both songs loaded and the plan set.
@@ -718,7 +703,7 @@ mod tests {
         let a = song(40.0, 120.0, 440.0, 1_000.0);
         let b = song(40.0, 125.0, 660.0, 5_000.0);
         // A leaves at 20 s over 4 bars (8 s); B enters at 2.4 s (5 beats in).
-        let t = blend(20_000.0, 2_400.0, 4);
+        let t = blend(20_000.0, 2_400.0, Bars::Four);
         let plan = Plan { entries: vec![entry("a", 120.0, Some(t)), entry("b", 125.0, None)], preview: None };
         let mut e = engine(plan, &[("a", a), ("b", b)]);
         e.command(Command::Play { index: 0, position_ms: 10_000.0 });
@@ -789,7 +774,7 @@ mod tests {
     fn seeking_into_a_window_starts_the_transition_there() {
         let a = song(40.0, 120.0, 440.0, 1_000.0);
         let b = song(40.0, 120.0, 660.0, 5_000.0);
-        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 0.0, 4))), entry("b", 120.0, None)], preview: None };
+        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 0.0, Bars::Four))), entry("b", 120.0, None)], preview: None };
         let mut e = engine(plan, &[("a", a), ("b", b)]);
         e.command(Command::Play { index: 0, position_ms: 24_000.0 });
         run(&mut e, 0.5);
@@ -804,7 +789,7 @@ mod tests {
     fn seeking_past_a_window_plays_out_then_cuts() {
         let a = song(30.0, 120.0, 440.0, 1_000.0);
         let b = song(40.0, 120.0, 660.0, 5_000.0);
-        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 0.0, 4))), entry("b", 120.0, None)], preview: None };
+        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 0.0, Bars::Four))), entry("b", 120.0, None)], preview: None };
         let mut e = engine(plan, &[("a", a), ("b", b)]);
         e.command(Command::Play { index: 0, position_ms: 29_000.0 });
         run(&mut e, 0.5);
@@ -820,7 +805,7 @@ mod tests {
     fn preview_loops_the_transition() {
         let a = song(40.0, 120.0, 440.0, 1_000.0);
         let b = song(40.0, 120.0, 660.0, 5_000.0);
-        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 0.0, 2))), entry("b", 120.0, None)], preview: Some(2_000.0) };
+        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 0.0, Bars::Two))), entry("b", 120.0, None)], preview: Some(2_000.0) };
         let mut e = engine(plan, &[("a", a), ("b", b)]);
         e.command(Command::Play { index: 0, position_ms: 18_000.0 });
         // 2 s lead, 4 s window, 3 s tail, then back to A at 18 s.
@@ -836,7 +821,7 @@ mod tests {
     fn next_and_previous_follow_the_entry_points() {
         let a = song(30.0, 120.0, 440.0, 1_000.0);
         let b = song(30.0, 120.0, 660.0, 5_000.0);
-        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 6_000.0, 4))), entry("b", 120.0, None)], preview: None };
+        let plan = Plan { entries: vec![entry("a", 120.0, Some(blend(20_000.0, 6_000.0, Bars::Four))), entry("b", 120.0, None)], preview: None };
         let mut e = engine(plan, &[("a", a), ("b", b)]);
         e.command(Command::Play { index: 0, position_ms: 5_000.0 });
         e.command(Command::Next);
@@ -886,7 +871,7 @@ mod tests {
     /// A at 120 BPM leaving at `out_ms` over 4 bars, looping the first and
     /// loud until the end, so the loop can be heard all through the window.
     fn looping_out(out_ms: f64) -> Transition {
-        let mut t = blend(out_ms, 0.0, 4);
+        let mut t = blend(out_ms, 0.0, Bars::Four);
         t.set_volume(Volume::FadeInCutOut);
         t.looping = Looping::FourBeat;
         t
@@ -915,7 +900,7 @@ mod tests {
         let echo_after = |effect: Effect| {
             let a = song(40.0, 120.0, 440.0, 1_000.0);
             let b = song(40.0, 120.0, 660.0, 5_000.0);
-            let mut t = blend(20_000.0, 0.0, 2);
+            let mut t = blend(20_000.0, 0.0, Bars::Two);
             t.set_volume(Volume::FadeInCutOut);
             t.set_effect(effect);
             let plan = Plan { entries: vec![entry("a", 120.0, Some(t)), entry("b", 120.0, None)], preview: None };
