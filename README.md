@@ -120,8 +120,8 @@ Hold shift to select text in the terminal as usual.
 transition window shaded across both. Each song's curves are drawn over its waveform, one colour per
 kind: volume blue (full at the top), EQ yellow (flat in the middle, cuts go down; the fainter lines
 are the mids and highs), filter pink (open in the middle, a high-pass closes upwards and a low-pass
-downwards), effects white (more send, higher). Bar lines run above A and below B. When A loops, `↺`
-marks each jump back and the repeats show dimmer.
+downwards; noise grows upwards), effects white (more send, higher). Bar lines run above A and below
+B. When A loops, `↺` marks each jump back and the repeats show dimmer.
 
 | | |
 | --- | --- |

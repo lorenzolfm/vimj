@@ -697,7 +697,8 @@ fn lane_color(lane: Lane) -> Color {
 /// height: value 0 at `zero` and 1 at `one`. Volume and effects fill it
 /// from the bottom. EQ rests in the middle and cuts down from there. The
 /// filter is open in the middle, a high-pass closing upwards and a low-pass
-/// downwards, as on a DJ mixer's one filter knob.
+/// downwards, as on a DJ mixer's one filter knob, and noise grows upwards
+/// from there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Scale {
     zero: f32,
@@ -709,8 +710,11 @@ impl Scale {
         match lane {
             Lane::Volume | Lane::Effect => Scale { zero: 0.0, one: 1.0 },
             Lane::Eq => Scale { zero: 0.0, one: 0.5 },
-            Lane::Filter if t.filter.kind(track) == Some(FilterKind::LowPass) => Scale { zero: 0.5, one: 0.0 },
-            Lane::Filter => Scale { zero: 0.5, one: 1.0 },
+            Lane::Filter => match t.filter.kind(track) {
+                Some(FilterKind::LowPass) => Scale { zero: 0.5, one: 0.0 },
+                // A song the filter leaves alone has no curve to place.
+                Some(FilterKind::HighPass | FilterKind::Noise) | None => Scale { zero: 0.5, one: 1.0 },
+            },
         }
     }
 
@@ -1023,21 +1027,21 @@ pub fn draw(frame: &mut Frame, area: Rect, editor: &Editor, waveforms: &HashMap<
         let (Some(d), Some(points)) = (drawing, drawing.and_then(|d| t.curve(d.lane, track))) else { return Vec::new() };
         let scale = Scale::of(t, d.lane, track);
         let active = d.track == track;
-        let mut marks: Vec<Mark> = points
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let (glyph, style) = match (active, i == d.point) {
+        let picked = active.then_some(d.point);
+        // The picked point first, so that it wins a cell it shares.
+        picked
+            .into_iter()
+            .chain((0..points.len()).filter(|&i| Some(i) != picked))
+            .filter_map(|i| {
+                let p = points.get(i)?;
+                let (glyph, style) = match (active, Some(i) == picked) {
                     (true, true) => ("◆", bold(accent())),
                     (true, false) => ("●", text()),
                     (false, _) => ("●", dim()),
                 };
-                Mark { x: p.x, height: scale.height(p.y), glyph, style }
+                Some(Mark { x: p.x, height: scale.height(p.y), glyph, style })
             })
-            .collect();
-        // The picked point wins a cell it shares.
-        marks.sort_by_key(|m| m.glyph != "◆");
-        marks
+            .collect()
     };
     // A song's waveform: its curve to pick points from while drawing,
     // otherwise its cue to drag.
@@ -1220,7 +1224,19 @@ fn field_note(t: &Transition, field: Field, timing: &vimj_core::transition::Timi
         Field::In => format!("Where B comes in · {cue_keys}"),
         Field::Volume => curves(Lane::Volume, "Top is full volume"),
         Field::Eq => curves(Lane::Eq, "Middle is flat, down cuts the bass; fainter lines are the mids and highs"),
-        Field::Filter => curves(Lane::Filter, "Middle is open, up closes a high-pass, down a low-pass"),
+        Field::Filter => {
+            let way = |track: Track| {
+                let name = track_name(track);
+                t.filter.kind(track).map(|kind| match kind {
+                    FilterKind::LowPass => format!("{name}'s low-pass closes downwards"),
+                    FilterKind::HighPass => format!("{name}'s high-pass closes upwards"),
+                    FilterKind::Noise => format!("noise over {name} grows upwards"),
+                })
+            };
+            let ways: Vec<String> = [Track::Out, Track::In].into_iter().filter_map(way).collect();
+            let open = if ways.is_empty() { String::new() } else { format!("Open in the middle: {}", ways.join(", ")) };
+            curves(Lane::Filter, &open)
+        }
         Field::Effect => {
             let rings = match t.effect.kind() {
                 Some(_) if t.effect.rings_out() => "On A, rising with the send, and rings on after the window",
